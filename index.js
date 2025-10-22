@@ -8,6 +8,7 @@ const app = express();
 
 console.log("MW UP", "secret_len", (process.env.SHOPIFY_WEBHOOK_SECRET || "").length);
 
+// ---------- utils ----------
 function hmacOk(raw, header, secret) {
   if (!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -42,6 +43,7 @@ function bundleKey(li) {
   return f2 ? String(f2.value) : null;
 }
 
+// ---------- transform ----------
 function transformOrder(order) {
   const before = order.line_items.map(li => ({
     id: li.id, title: li.title, sku: li.sku || null, qty: li.quantity,
@@ -70,6 +72,7 @@ function transformOrder(order) {
       const parentTotal = toNum(parent.price) * parent.quantity;
       let qtySum = 0; for (const c of kids) qtySum += c.quantity;
 
+      // parent -> 0
       after.push({ id: parent.id, title: parent.title, sku: parent.sku || null, qty: parent.quantity, unitPrice: 0, parent: true, key: k });
 
       if (parentTotal > 0 && qtySum > 0) {
@@ -97,10 +100,12 @@ function transformOrder(order) {
   return { before, after };
 }
 
+// ---------- memory ----------
 const history = [];
 function remember(entry) { history.push(entry); while (history.length > 100) history.shift(); }
 const last = () => (history.length ? history[history.length - 1] : null);
 
+// ---------- webhook ----------
 app.post("/webhooks/orders-create", async (req, res) => {
   const raw = await getRawBody(req);
   const hdr = req.headers["x-shopify-hmac-sha256"] || "";
@@ -127,20 +132,29 @@ app.post("/webhooks/orders-create", async (req, res) => {
   res.status(200).send("ok");
 });
 
+// ---------- debug & health ----------
 app.get("/debug/last", (req,res)=>res.json(last()));
-app.post("/test", express.text({ type: "*/*" }), (req,res)=>{ console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"]||""); res.send("ok"); });
 app.get("/health", (req,res)=>res.send("ok"));
 
+// ---------- ShipStation (Custom Store XML) ----------
 function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function orderToXML(o){
-  if (!o) return "<Orders total=\"0\" page=\"1\" pages=\"1\"></Orders>";
+
+function orderToXML(o, page=1, pages=1){
+  const total = o ? 1 : 0;
+  if (!o) {
+    return `<?xml version="1.0" encoding="utf-8"?>
+<Orders total="0" page="${page}" pages="${pages}">
+  <Total>0</Total><Page>${page}</Page><Pages>${pages}</Pages>
+</Orders>`;
+  }
   const items = o.payload.after.filter(i=>!i.parent).map(i=>(
     `<Item><SKU>${esc(i.sku||"")}</SKU><Name>${esc(i.title)}</Name><Quantity>${i.qty}</Quantity><UnitPrice>${i.unitPrice.toFixed(2)}</UnitPrice></Item>`
   )).join("");
   const shipTo = o.shipping_address||{};
   const billTo = o.billing_address||{};
   return `<?xml version="1.0" encoding="utf-8"?>
-<Orders total="1" page="1" pages="1">
+<Orders total="${total}" page="${page}" pages="${pages}">
+  <Total>${total}</Total><Page>${page}</Page><Pages>${pages}</Pages>
   <Order>
     <OrderID>${esc(String(o.id))}</OrderID>
     <OrderNumber>${esc(o.name)}</OrderNumber>
@@ -184,7 +198,12 @@ function logSS(req, tag){ console.log(`[SS] ${tag}`, req.method, req.originalUrl
 
 function shipstationHandler(req, res) {
   logSS(req,"hit");
-  res.type("text/xml");
+  res.set({
+    "Content-Type": "application/xml; charset=utf-8",
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0"
+  });
 
   if (!process.env.SS_USER || !process.env.SS_PASS) { res.status(503).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth not configured</Error>`); return; }
   if (!authOK(req)) { res.status(401).set("WWW-Authenticate","Basic").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`); return; }
@@ -195,10 +214,11 @@ function shipstationHandler(req, res) {
   const action = (q.action || "").toLowerCase();
 
   if (action === "test" || action === "status") {
-    res.send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
+    res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
     return;
   }
 
+  // export (или без action)
   let o = last();
   const start = q.start_date ? Date.parse(q.start_date) : null;
   const end   = q.end_date   ? Date.parse(q.end_date)   : null;
@@ -206,11 +226,15 @@ function shipstationHandler(req, res) {
     const created = Date.parse(o.created_at || new Date().toISOString());
     if ((start && created < start) || (end && created > end)) o = null;
   }
-  res.send(orderToXML(o));
+
+  const page = Number(q.page || 1) || 1;
+  const xml = orderToXML(o, page, 1);
+  res.status(200).send(xml);
 }
 
 app.get("/shipstation", shipstationHandler);
 app.post("/shipstation", shipstationHandler);
 app.head("/shipstation", shipstationHandler);
 
+// ---------- start ----------
 app.listen(process.env.PORT || 8080);
