@@ -17,6 +17,7 @@ function hmacOk(raw, header, secret) {
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
+
 function pickMark(order) {
   const note = String(order.note || "");
   const mT = note.match(/__MW_THEME\s*=\s*([^\s;]+)/i);
@@ -26,7 +27,42 @@ function pickMark(order) {
   if (attrs.__MW_THEME) return { theme: attrs.__MW_THEME, debug: attrs.__MW_DEBUG === "on" };
   return null;
 }
-function toNum(x) { const n = Number.parseFloat(String(x || "0")); return Number.isFinite(n) ? n : 0; }
+
+function toNum(x) {
+  const n = Number.parseFloat(String(x || "0"));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fmtShipDate(d = new Date()) {
+  // MM/dd/yyyy HH:mm  (UTC)
+  const dt = new Date(d);
+  const pad = n => String(n).padStart(2, "0");
+  const MM = pad(dt.getUTCMonth() + 1);
+  const DD = pad(dt.getUTCDate());
+  const YYYY = dt.getUTCFullYear();
+  const hh = pad(dt.getUTCHours());
+  const mm = pad(dt.getUTCMinutes());
+  return `${MM}/${DD}/${YYYY} ${hh}:${mm}`;
+}
+
+function esc(x = "") {
+  return String(x)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function money2(v) {
+  const n = Number.isFinite(v) ? v : 0;
+  return n.toFixed(2);
+}
+
+function sum(items) {
+  return items.reduce(
+    (s, i) => s + Number(i.unitPrice || 0) * Number(i.qty || 0),
+    0
+  );
+}
 
 // ----- bundle helpers -----
 function isBundleParent(li) {
@@ -46,12 +82,6 @@ function bundleKey(li) {
 
 // ---------- transform ----------
 function transformOrder(order) {
-  const before = order.line_items.map(li => ({
-    id: li.id, title: li.title, sku: li.sku || null, qty: li.quantity,
-    price: toNum(li.price), total: toNum(li.price) * li.quantity,
-    key: bundleKey(li), parent: isBundleParent(li)
-  }));
-
   const groups = {};
   for (const li of order.line_items) {
     const k = bundleKey(li);
@@ -73,7 +103,6 @@ function transformOrder(order) {
       const parentTotal = toNum(parent.price) * parent.quantity;
       let qtySum = 0; for (const c of kids) qtySum += c.quantity;
 
-      // parent -> 0
       after.push({ id: parent.id, title: parent.title, sku: parent.sku || null, qty: parent.quantity, unitPrice: 0, parent: true, key: k });
 
       if (parentTotal > 0 && qtySum > 0) {
@@ -98,7 +127,7 @@ function transformOrder(order) {
     after.push({ id: li.id, title: li.title, sku: li.sku || null, qty: li.quantity, unitPrice: toNum(li.price), parent: false, key: bundleKey(li) });
   }
 
-  return { before, after };
+  return { after };
 }
 
 // ---------- memory ----------
@@ -120,103 +149,129 @@ app.post("/webhooks/orders-create", async (req, res) => {
   const conv = transformOrder(order);
   remember({
     id: order.id, name: order.name,
-    theme: mark.theme, debug: mark.debug,
-    currency: order.currency, total_price: order.total_price,
-    email: order.email,
-    shipping_address: order.shipping_address,
-    billing_address: order.billing_address,
+    currency: order.currency, total_price: toNum(order.total_price),
+    email: order.email || "",
+    shipping_address: order.shipping_address || {},
+    billing_address: order.billing_address || {},
     payload: conv,
     created_at: new Date().toISOString()
   });
 
-  console.log("MATCH", order.id, order.name, mark, "items:", conv.after.length);
+  console.log("MATCH", order.id, order.name, "items:", conv.after.length);
   res.status(200).send("ok");
 });
 
 // ---------- XML helpers ----------
-function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function money2(v){ return (Number.isFinite(v)? v:0).toFixed(2); }
-function sum(items){ return items.reduce((s,i)=> s + (i.unitPrice * i.qty), 0); }
+function skuSafe(i, orderId) {
+  const s = (i.sku || "").trim();
+  if (s) return s;
+  const base = i.id ? String(i.id) : (i.title ? i.title.replace(/\s+/g, "-").slice(0, 24) : "ITEM");
+  return `MW-${orderId}-${base}`;
+}
 
-// Полный XML под ShipStation
-function orderToXML(o, page=1, pages=1){
-  const total = o ? 1 : 0;
+function normState(s) {
+  const v = (s || "").trim();
+  if (!v) return "ST";
+  return v.length === 2 ? v : v.slice(0, 2).toUpperCase();
+}
 
+function filledAddress(a){
+  const d = v => (v && String(v).trim()) ? String(v) : "";
+  const name = [d(a.first_name), d(a.last_name)].filter(Boolean).join(" ") || "Customer";
+  return {
+    name,
+    company: d(a.company) || "",
+    phone: d(a.phone) || "",
+    email: d(a.email) || "",
+    address1: d(a.address1) || "Address line 1",
+    address2: d(a.address2) || "",
+    city:    d(a.city) || "City",
+    state:   normState(a.province_code || a.province),
+    zip:     d(a.zip) || "00000",
+    country: (d(a.country_code) || "US").slice(0,2).toUpperCase()
+  };
+}
+
+function minimalXML(o){
   if (!o) {
     return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
-  <Total>0</Total>
-  <Page>${page}</Page>
-  <Pages>${pages}</Pages>
 </Orders>`;
   }
 
-  const children = o.payload.after ? o.payload.after.filter(i=>!i.parent) : [];
-  const orderSubtotal = children.reduce((s,i)=> s + (i.unitPrice * i.qty), 0);
-  const shippingAmount = 0;
-  const taxAmount = 0;
-  const orderTotal = orderSubtotal + shippingAmount + taxAmount;
+  // children items = только реальные (parent=false)
+  let children = (o.payload?.after || []).filter(i => !i.parent);
+  if (!children.length) {
+    children = [{ id: "FALLBACK", title: "Bundle", sku: "BUNDLE", qty: 1, unitPrice: Number(o.total_price || 0) }];
+  }
+
+  // суммы
+  const subtotal = sum(children);
+  const tax = 0;
+  const shipping = 0;
+  const total = subtotal + tax + shipping;
+
+  // адреса
+  const bill = filledAddress(o.billing_address || {});
+  const ship = filledAddress(o.shipping_address || {});
+  const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
+  const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
+  const lastMod   = fmtShipDate(new Date());
 
   const itemsXml = children.map(i => `
-    <Item>
-      <SKU>${esc(i.sku||"")}</SKU>
-      <Name>${esc(i.title||"")}</Name>
-      <Quantity>${i.qty||0}</Quantity>
-      <UnitPrice>${(Number.isFinite(i.unitPrice)?i.unitPrice:0).toFixed(2)}</UnitPrice>
-      <Adjustment>false</Adjustment>
-    </Item>`).join("");
+      <Item>
+        <LineItemID>${esc(String(i.id || ""))}</LineItemID>
+        <SKU>${esc(skuSafe(i, o.id))}</SKU>
+        <Name>${esc(i.title || "Item")}</Name>
+        <Quantity>${Math.max(1, parseInt(i.qty || 0, 10))}</Quantity>
+        <UnitPrice>${money2(Number.isFinite(i.unitPrice) ? i.unitPrice : 0)}</UnitPrice>
+        <Adjustment>false</Adjustment>
+      </Item>`).join("");
 
-  const shipTo = o.shipping_address||{};
-  const billTo = o.billing_address||{};
-  const email = o.email || "";
-
+  // структура точно по референс-схеме
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
-  <Total>1</Total>
-  <Page>${page}</Page>
-  <Pages>${pages}</Pages>
   <Order>
     <OrderID>${esc(String(o.id))}</OrderID>
-    <OrderNumber>${esc(o.name||"")}</OrderNumber>
-    <OrderDate>${new Date().toISOString()}</OrderDate>
-    <LastModified>${new Date().toISOString()}</LastModified>
+    <OrderNumber>${esc(o.name || String(o.id))}</OrderNumber>
+    <OrderDate>${orderDate}</OrderDate>
     <OrderStatus>awaiting_shipment</OrderStatus>
+    <LastModified>${lastMod}</LastModified>
 
-    <CustomerEmail>${esc(email)}</CustomerEmail>
-    <CustomerUsername>${esc(email)}</CustomerUsername>
-
-    <PaymentMethod>Other</PaymentMethod>
-    <RequestedShippingService>Ground</RequestedShippingService>
     <ShippingMethod>Ground</ShippingMethod>
-
-    <OrderTotal>${orderTotal.toFixed(2)}</OrderTotal>
-    <TaxAmount>${taxAmount.toFixed(2)}</TaxAmount>
-    <ShippingAmount>${shippingAmount.toFixed(2)}</ShippingAmount>
-    <Subtotal>${orderSubtotal.toFixed(2)}</Subtotal>
+    <PaymentMethod>Other</PaymentMethod>
     <CurrencyCode>${esc(o.currency || "USD")}</CurrencyCode>
 
-    <BillTo>
-      <Name>${esc([billTo.first_name,billTo.last_name].filter(Boolean).join(" "))}</Name>
-      <Street1>${esc(billTo.address1||"")}</Street1>
-      <Street2>${esc(billTo.address2||"")}</Street2>
-      <City>${esc(billTo.city||"")}</City>
-      <State>${esc(billTo.province_code||"")}</State>
-      <PostalCode>${esc(billTo.zip||"")}</PostalCode>
-      <Country>${esc(billTo.country_code||"")}</Country>
-      <Phone>${esc(billTo.phone||"")}</Phone>
-    </BillTo>
+    <OrderTotal>${money2(total)}</OrderTotal>
+    <TaxAmount>${money2(tax)}</TaxAmount>
+    <ShippingAmount>${money2(shipping)}</ShippingAmount>
 
-    <ShipTo>
-      <Name>${esc([shipTo.first_name,shipTo.last_name].filter(Boolean).join(" "))}</Name>
-      <Street1>${esc(shipTo.address1||"")}</Street1>
-      <Street2>${esc(shipTo.address2||"")}</Street2>
-      <City>${esc(shipTo.city||"")}</City>
-      <State>${esc(shipTo.province_code||"")}</State>
-      <PostalCode>${esc(shipTo.zip||"")}</PostalCode>
-      <Country>${esc(shipTo.country_code||"")}</Country>
-      <Phone>${esc(shipTo.phone||"")}</Phone>
-      <Residential>false</Residential>
-    </ShipTo>
+    <Customer>
+      <CustomerCode>${esc(email)}</CustomerCode>
+      <BillTo>
+        <Name>${esc(bill.name)}</Name>
+        <Company>${esc(bill.company)}</Company>
+        <Phone>${esc(bill.phone)}</Phone>
+        <Email>${esc(email)}</Email>
+        <Address1>${esc(bill.address1)}</Address1>
+        <Address2>${esc(bill.address2)}</Address2>
+        <City>${esc(bill.city)}</City>
+        <State>${esc(bill.state)}</State>
+        <PostalCode>${esc(bill.zip)}</PostalCode>
+        <Country>${esc(bill.country)}</Country>
+      </BillTo>
+      <ShipTo>
+        <Name>${esc(ship.name)}</Name>
+        <Company>${esc(ship.company)}</Company>
+        <Address1>${esc(ship.address1)}</Address1>
+        <Address2>${esc(ship.address2)}</Address2>
+        <City>${esc(ship.city)}</City>
+        <State>${esc(ship.state)}</State>
+        <PostalCode>${esc(ship.zip)}</PostalCode>
+        <Country>${esc(ship.country)}</Country>
+        <Phone>${esc(ship.phone)}</Phone>
+      </ShipTo>
+    </Customer>
 
     <Items>${itemsXml}
     </Items>
@@ -224,10 +279,10 @@ function orderToXML(o, page=1, pages=1){
 </Orders>`;
 }
 
-// sample-order на время Connect
+// sample на время коннекта/импорта
 function buildSampleOrder(){
   const now = new Date().toISOString();
-  const o = {
+  return {
     id: 999000111,
     name: "#SAMPLE",
     currency: "USD",
@@ -244,13 +299,13 @@ function buildSampleOrder(){
     },
     payload: {
       after: [
-        { id: 1, title: "Mycolean Classic 4-Pack", sku: "MYCO-4PK", qty: 1, unitPrice: 49.95, parent: false },
-        { id: 2, title: "Mystery Bottle", sku: "MYCO-MYST", qty: 1, unitPrice: 0.00, parent: false }
+        { id: "S1", title: "Mycolean Classic 4-Pack", sku: "MYCO-4PK", qty: 1, unitPrice: 49.95, parent: false },
+        { id: "S2", title: "Mystery Bottle", sku: "MYCO-MYST", qty: 1, unitPrice: 0.00, parent: false }
       ]
     },
+    total_price: 49.95,
     created_at: now
   };
-  return o;
 }
 
 // ---------- auth ----------
@@ -287,28 +342,34 @@ function shipstationHandler(req, res) {
   const action = (q.action || "").toLowerCase();
 
   if (action === "test" || action === "status") {
-    res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
+    const xml = `<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`;
+    console.log("[SS] xml(test):", xml.slice(0, 200));
+    res.status(200).send(xml);
     return;
   }
 
-  // export (или без action)
   let o = last();
 
-  // если нет матчей и включён флаг — отдаём sample, чтобы пройти Connect
   if (!o && String(process.env.SS_SAMPLE_ON_EMPTY || "").toLowerCase() === "true") {
     o = buildSampleOrder();
-    console.log("[SS] using SAMPLE order for connect");
+    console.log("[SS] using SAMPLE order");
   }
 
-  const start = q.start_date ? Date.parse(q.start_date) : null;
-  const end   = q.end_date   ? Date.parse(q.end_date)   : null;
-  if (o && (start || end)) {
-    const created = Date.parse(o.created_at || new Date().toISOString());
-    if ((start && created < start) || (end && created > end)) o = null;
+  const strictDates = String(process.env.SS_STRICT_DATES || "").toLowerCase() === "true";
+  if (o && strictDates) {
+    const start = q.start_date ? Date.parse(q.start_date) : null;
+    const end   = q.end_date   ? Date.parse(q.end_date)   : null;
+    if (start || end) {
+      const created = Date.parse(o.created_at || new Date().toISOString());
+      if ((start && created < start) || (end && created > end)) {
+        console.log("[SS] filtered out by date window", { created, start, end });
+        o = null;
+      }
+    }
   }
 
-  const page = Number(q.page || 1) || 1;
-  const xml = orderToXML(o, page, 1);
+  const xml = minimalXML(o);
+  console.log("[SS] xml(export):", xml.slice(0, 300).replace(/\s+/g,' ').trim());
   res.status(200).send(xml);
 }
 
