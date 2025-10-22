@@ -1,0 +1,13 @@
+{
+  "name": "mw-mycolean",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "raw-body": "^2.5.2",
+    "dotenv": "^16.4.5"
+  }
+}
