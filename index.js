@@ -8,7 +8,7 @@ const app = express();
 
 console.log("MW UP", "secret_len", (process.env.SHOPIFY_WEBHOOK_SECRET || "").length);
 
-// ---------------- utils ----------------
+// ---------- utils ----------
 function hmacOk(raw, header, secret) {
   if (!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -28,12 +28,11 @@ function pickMark(order) {
 }
 function toNum(x) { const n = Number.parseFloat(String(x || "0")); return Number.isFinite(n) ? n : 0; }
 
-// ---- эвристики Simple Bundles / SKIO ----
 function isBundleParent(li) {
   const p = li.properties || [];
-  if (p.find(x => x.name === "_sb_parent" && String(x.value).toLowerCase() === "true")) return true;   // Simple Bundles
-  if (p.find(x => x.name === "_bundle" || x.name === "bundle_id")) return true;                        // др. приложения
-  if (p.find(x => x.name === "skio_parent" && String(x.value).toLowerCase() === "true")) return true;  // SKIO (если ставит)
+  if (p.find(x => x.name === "_sb_parent" && String(x.value).toLowerCase() === "true")) return true;
+  if (p.find(x => x.name === "_bundle" || x.name === "bundle_id")) return true;
+  if (p.find(x => x.name === "skio_parent" && String(x.value).toLowerCase() === "true")) return true;
   return false;
 }
 function bundleKey(li) {
@@ -44,7 +43,7 @@ function bundleKey(li) {
   return f2 ? String(f2.value) : null;
 }
 
-// перерасчёт: родителю 0, цену раскладываем по детям пропорционально qty
+// ---------- transform ----------
 function transformOrder(order) {
   const before = order.line_items.map(li => ({
     id: li.id, title: li.title, sku: li.sku || null, qty: li.quantity,
@@ -52,7 +51,6 @@ function transformOrder(order) {
     key: bundleKey(li), parent: isBundleParent(li)
   }));
 
-  // группируем по bundle-key
   const groups = {};
   for (const li of order.line_items) {
     const k = bundleKey(li);
@@ -75,10 +73,8 @@ function transformOrder(order) {
       let qtySum = 0;
       for (const c of kids) qtySum += c.quantity;
 
-      // родителя нулим
       after.push({ id: parent.id, title: parent.title, sku: parent.sku || null, qty: parent.quantity, unitPrice: 0, parent: true, key: k });
 
-      // распределяем цену на детей
       if (parentTotal > 0 && qtySum > 0) {
         let rest = Math.round(parentTotal * 100);
         for (let i = 0; i < kids.length; i++) {
@@ -89,7 +85,6 @@ function transformOrder(order) {
           after.push({ id: c.id, title: c.title, sku: c.sku || null, qty: c.quantity, unitPrice: Number(unit.toFixed(2)), parent: false, key: k });
         }
       } else {
-        // если у родителя нулевая цена — оставляем детей как есть
         for (const c of kids) {
           after.push({ id: c.id, title: c.title, sku: c.sku || null, qty: c.quantity, unitPrice: toNum(c.price), parent: false, key: k });
         }
@@ -97,7 +92,6 @@ function transformOrder(order) {
     }
   }
 
-  // обычные позиции
   for (const li of order.line_items) {
     if (handled.has(li.id)) continue;
     after.push({ id: li.id, title: li.title, sku: li.sku || null, qty: li.quantity, unitPrice: toNum(li.price), parent: false, key: bundleKey(li) });
@@ -106,12 +100,12 @@ function transformOrder(order) {
   return { before, after };
 }
 
-// ---------------- storage ----------------
-const history = []; // только MATCH (с меткой)
+// ---------- memory ----------
+const history = [];
 function remember(entry) { history.push(entry); while (history.length > 50) history.shift(); }
 const last = () => (history.length ? history[history.length - 1] : null);
 
-// ---------------- webhooks ----------------
+// ---------- webhook ----------
 app.post("/webhooks/orders-create", async (req, res) => {
   const raw = await getRawBody(req);
   const hdr = req.headers["x-shopify-hmac-sha256"] || "";
@@ -123,80 +117,88 @@ app.post("/webhooks/orders-create", async (req, res) => {
   if (!mark || !String(mark.theme || "").startsWith("preview-")) { console.log("skip", order.id, order.name); res.status(200).send("skip"); return; }
 
   const conv = transformOrder(order);
-  const entry = {
-    id: order.id,
-    name: order.name,
-    theme: mark.theme,
-    debug: mark.debug,
-    currency: order.currency,
-    total_price: order.total_price,
+  remember({
+    id: order.id, name: order.name,
+    theme: mark.theme, debug: mark.debug,
+    currency: order.currency, total_price: order.total_price,
     email: order.email,
     shipping_address: order.shipping_address,
     billing_address: order.billing_address,
     payload: conv
-  };
-  remember(entry);
+  });
+
   console.log("MATCH", order.id, order.name, mark, "items:", conv.after.length);
   res.status(200).send("ok");
 });
 
-// ---------------- debug ----------------
-app.get("/debug/last", (req, res) => { res.json(last()); });
-app.post("/test", express.text({ type: "*/*" }), (req, res) => { console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"] || ""); res.send("ok"); });
-app.get("/health", (req, res) => res.send("ok"));
-
-// ---------------- ShipStation (read-only) ----------------
+// ---------- basic auth for ShipStation ----------
 function basicAuth(req, res, next) {
   if (!process.env.SS_USER || !process.env.SS_PASS) return res.status(503).send("ShipStation auth not configured");
   const h = req.headers.authorization || "";
-  const ok = h.startsWith("Basic ");
-  if (!ok) return res.status(401).set("WWW-Authenticate","Basic").send("auth");
+  if (!h.startsWith("Basic ")) return res.status(401).set("WWW-Authenticate","Basic").send("auth");
   const [u, p] = Buffer.from(h.slice(6), "base64").toString("utf8").split(":", 2);
   if (u === process.env.SS_USER && p === process.env.SS_PASS) return next();
   return res.status(401).set("WWW-Authenticate","Basic").send("auth");
 }
 
-function toShipStation(o) {
-  if (!o) return null;
-  const items = o.payload.after
-    .filter(i => !i.parent) // склад видит только детей
-    .map(i => ({ sku: i.sku || "", name: i.title, quantity: i.qty, unitPrice: i.unitPrice }));
-  return {
-    orders: [{
-      orderId: String(o.id),
-      orderNumber: o.name,
-      orderDate: new Date().toISOString(),
-      orderStatus: "awaiting_shipment",
-      billTo: {
-        name: o.billing_address ? [o.billing_address.first_name, o.billing_address.last_name].filter(Boolean).join(" ") : "",
-        street1: o.billing_address?.address1 || "",
-        city: o.billing_address?.city || "",
-        state: o.billing_address?.province_code || "",
-        postalCode: o.billing_address?.zip || "",
-        country: o.billing_address?.country_code || ""
-      },
-      shipTo: {
-        name: o.shipping_address ? [o.shipping_address.first_name, o.shipping_address.last_name].filter(Boolean).join(" ") : "",
-        street1: o.shipping_address?.address1 || "",
-        city: o.shipping_address?.city || "",
-        state: o.shipping_address?.province_code || "",
-        postalCode: o.shipping_address?.zip || "",
-        country: o.shipping_address?.country_code || ""
-      },
-      items
-    }],
-    total: 1,
-    page: 1,
-    pages: 1
-  };
+// ---------- XML builder ----------
+function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function orderToXML(o){
+  if (!o) return "<Orders total=\"0\" page=\"1\" pages=\"1\"></Orders>";
+  const items = o.payload.after.filter(i=>!i.parent).map(i=>(
+    `<Item>
+      <SKU>${esc(i.sku||"")}</SKU>
+      <Name>${esc(i.title)}</Name>
+      <Quantity>${i.qty}</Quantity>
+      <UnitPrice>${i.unitPrice.toFixed(2)}</UnitPrice>
+    </Item>`
+  )).join("");
+  const shipTo = o.shipping_address||{};
+  const billTo = o.billing_address||{};
+  return `<?xml version="1.0" encoding="utf-8"?>
+<Orders total="1" page="1" pages="1">
+  <Order>
+    <OrderID>${esc(String(o.id))}</OrderID>
+    <OrderNumber>${esc(o.name)}</OrderNumber>
+    <OrderDate>${new Date().toISOString()}</OrderDate>
+    <OrderStatus>awaiting_shipment</OrderStatus>
+    <BillTo>
+      <Name>${esc([billTo.first_name,billTo.last_name].filter(Boolean).join(" "))}</Name>
+      <Street1>${esc(billTo.address1||"")}</Street1>
+      <City>${esc(billTo.city||"")}</City>
+      <State>${esc(billTo.province_code||"")}</State>
+      <PostalCode>${esc(billTo.zip||"")}</PostalCode>
+      <Country>${esc(billTo.country_code||"")}</Country>
+    </BillTo>
+    <ShipTo>
+      <Name>${esc([shipTo.first_name,shipTo.last_name].filter(Boolean).join(" "))}</Name>
+      <Street1>${esc(shipTo.address1||"")}</Street1>
+      <City>${esc(shipTo.city||"")}</City>
+      <State>${esc(shipTo.province_code||"")}</State>
+      <PostalCode>${esc(shipTo.zip||"")}</PostalCode>
+      <Country>${esc(shipTo.country_code||"")}</Country>
+    </ShipTo>
+    <Items>${items}</Items>
+  </Order>
+</Orders>`;
 }
 
-app.get("/shipstation/ping", basicAuth, (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
-app.get("/shipstation/orders", basicAuth, (req, res) => {
-  // игнорируем фильтры для простоты — отдаём последний MATCH
+// ---------- ShipStation endpoints (Custom Store) ----------
+app.get("/shipstation", basicAuth, (req,res)=>{
+  // Test Connection: ShipStation часто делает просто GET без параметров или с action=test
+  const action = (req.query.action||"").toString().toLowerCase();
+  if (action === "test") {
+    res.type("application/xml").send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
+    return;
+  }
   const o = last();
-  res.json(toShipStation(o) || { orders: [], total: 0, page: 1, pages: 1 });
+  res.type("application/xml").send(orderToXML(o));
 });
 
-// ---------------- start ----------------
+// ---------- debug & health ----------
+app.get("/debug/last", (req,res)=>res.json(last()));
+app.post("/test", express.text({ type: "*/*" }), (req,res)=>{ console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"]||""); res.send("ok"); });
+app.get("/health", (req,res)=>res.send("ok"));
+
+// ---------- start ----------
 app.listen(process.env.PORT || 8080);
