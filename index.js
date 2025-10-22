@@ -8,7 +8,7 @@ const app = express();
 
 console.log("MW UP", "secret_len", (process.env.SHOPIFY_WEBHOOK_SECRET || "").length);
 
-// ---------- utils ----------
+// ========== utils ==========
 function hmacOk(raw, header, secret) {
   if (!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -43,7 +43,7 @@ function bundleKey(li) {
   return f2 ? String(f2.value) : null;
 }
 
-// ---------- transform ----------
+// ========== transform ==========
 function transformOrder(order) {
   const before = order.line_items.map(li => ({
     id: li.id, title: li.title, sku: li.sku || null, qty: li.quantity,
@@ -72,6 +72,7 @@ function transformOrder(order) {
       const parentTotal = toNum(parent.price) * parent.quantity;
       let qtySum = 0; for (const c of kids) qtySum += c.quantity;
 
+      // parent -> 0
       after.push({ id: parent.id, title: parent.title, sku: parent.sku || null, qty: parent.quantity, unitPrice: 0, parent: true, key: k });
 
       if (parentTotal > 0 && qtySum > 0) {
@@ -99,12 +100,12 @@ function transformOrder(order) {
   return { before, after };
 }
 
-// ---------- memory ----------
-const history = []; // только MATCH
-function remember(entry) { history.push(entry); while (history.length > 50) history.shift(); }
+// ========== memory ==========
+const history = [];    // только MATCH
+function remember(entry) { history.push(entry); while (history.length > 100) history.shift(); }
 const last = () => (history.length ? history[history.length - 1] : null);
 
-// ---------- webhook ----------
+// ========== webhook ==========
 app.post("/webhooks/orders-create", async (req, res) => {
   const raw = await getRawBody(req);
   const hdr = req.headers["x-shopify-hmac-sha256"] || "";
@@ -123,19 +124,20 @@ app.post("/webhooks/orders-create", async (req, res) => {
     email: order.email,
     shipping_address: order.shipping_address,
     billing_address: order.billing_address,
-    payload: conv
+    payload: conv,
+    created_at: new Date().toISOString()
   });
 
   console.log("MATCH", order.id, order.name, mark, "items:", conv.after.length);
   res.status(200).send("ok");
 });
 
-// ---------- debug & health ----------
+// ========== debug & health ==========
 app.get("/debug/last", (req,res)=>res.json(last()));
 app.post("/test", express.text({ type: "*/*" }), (req,res)=>{ console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"]||""); res.send("ok"); });
 app.get("/health", (req,res)=>res.send("ok"));
 
-// ---------- ShipStation (Custom Store XML) ----------
+// ========== ShipStation (Custom Store XML) ==========
 function basicAuth(req, res, next) {
   if (!process.env.SS_USER || !process.env.SS_PASS) return res.status(503).send("ShipStation auth not configured");
   const h = req.headers.authorization || "";
@@ -145,6 +147,7 @@ function basicAuth(req, res, next) {
   return res.status(401).set("WWW-Authenticate","Basic").send("auth");
 }
 function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
 function orderToXML(o){
   if (!o) return "<Orders total=\"0\" page=\"1\" pages=\"1\"></Orders>";
   const items = o.payload.after.filter(i=>!i.parent).map(i=>(
@@ -185,29 +188,45 @@ function orderToXML(o){
 </Orders>`;
 }
 
-// лог запросов от ShipStation
+// лог запросов от SS
 function logSS(req, tag){
   console.log(`[SS] ${tag}`, req.method, req.originalUrl, req.headers["user-agent"]||"");
 }
 
-app.get("/shipstation", basicAuth, (req,res)=>{
-  logSS(req,"hit");
-  const action = String(req.query.action||"").toLowerCase();
+// единый обработчик для GET/POST/HEAD
+function shipstationHandler(req, res) {
+  logSS(req, "hit");
+  res.type("text/xml"); // SS любит text/xml
+  const method = req.method.toUpperCase();
+  if (method === "HEAD") { res.status(200).end(); return; }
 
-  // ShipStation любит text/xml
-  res.type("text/xml");
+  const q = Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k.toLowerCase(), String(v)]));
+  const action = (q.action || "").toLowerCase();
 
-  // Проверка соединения
+  // тест соединения / статус
   if (action === "test" || action === "status") {
     res.send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
     return;
   }
 
-  // Экспорт заказов
-  // (их UI часто зовёт без action, а некоторые версии — с action=export)
-  const o = last();
-  res.send(orderToXML(o));
-});
+  // экспорт заказов (action=export) или без action
+  let o = last();
 
-// ---------- start ----------
+  // фильтры по датам (не строго, просто демонстрация)
+  // SS присылает ISO или yyyy-mm-dd hh:mm:ss
+  const start = q.start_date ? Date.parse(q.start_date) : null;
+  const end   = q.end_date   ? Date.parse(q.end_date)   : null;
+  if (o && (start || end)) {
+    const created = Date.parse(o.created_at || new Date().toISOString());
+    if ((start && created < start) || (end && created > end)) {
+      o = null;
+    }
+  }
+
+  res.send(orderToXML(o));
+}
+app.get("/shipstation", basicAuth, shipstationHandler);
+app.post("/shipstation", basicAuth, shipstationHandler);
+
+// ========== start ==========
 app.listen(process.env.PORT || 8080);
