@@ -28,6 +28,7 @@ function pickMark(order) {
 }
 function toNum(x) { const n = Number.parseFloat(String(x || "0")); return Number.isFinite(n) ? n : 0; }
 
+// ----- bundle helpers -----
 function isBundleParent(li) {
   const p = li.properties || [];
   if (p.find(x => x.name === "_sb_parent" && String(x.value).toLowerCase() === "true")) return true;
@@ -132,13 +133,12 @@ app.post("/webhooks/orders-create", async (req, res) => {
   res.status(200).send("ok");
 });
 
-// ---------- debug & health ----------
-app.get("/debug/last", (req,res)=>res.json(last()));
-app.get("/health", (req,res)=>res.send("ok"));
-
-// ---------- ShipStation (Custom Store XML) ----------
+// ---------- helpers ----------
 function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function money2(v){ return (Number.isFinite(v)? v:0).toFixed(2); }
+function sum(items){ return items.reduce((s,i)=> s + (i.unitPrice * i.qty), 0); }
 
+// Полный XML под ShipStation
 function orderToXML(o, page=1, pages=1){
   const total = o ? 1 : 0;
   if (!o) {
@@ -147,11 +147,26 @@ function orderToXML(o, page=1, pages=1){
   <Total>0</Total><Page>${page}</Page><Pages>${pages}</Pages>
 </Orders>`;
   }
-  const items = o.payload.after.filter(i=>!i.parent).map(i=>(
-    `<Item><SKU>${esc(i.sku||"")}</SKU><Name>${esc(i.title)}</Name><Quantity>${i.qty}</Quantity><UnitPrice>${i.unitPrice.toFixed(2)}</UnitPrice></Item>`
-  )).join("");
+
+  const children = o.payload.after.filter(i=>!i.parent);
+  const orderSubtotal = sum(children);
+  const shippingAmount = 0;
+  const taxAmount = 0;
+  const orderTotal = orderSubtotal + shippingAmount + taxAmount;
+
+  const itemsXml = children.map(i => `
+    <Item>
+      <SKU>${esc(i.sku||"")}</SKU>
+      <Name>${esc(i.title)}</Name>
+      <Quantity>${i.qty}</Quantity>
+      <UnitPrice>${money2(i.unitPrice)}</UnitPrice>
+      <Adjustment>false</Adjustment>
+    </Item>`).join("");
+
   const shipTo = o.shipping_address||{};
   const billTo = o.billing_address||{};
+  const email = o.email || "";
+
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders total="${total}" page="${page}" pages="${pages}">
   <Total>${total}</Total><Page>${page}</Page><Pages>${pages}</Pages>
@@ -159,28 +174,52 @@ function orderToXML(o, page=1, pages=1){
     <OrderID>${esc(String(o.id))}</OrderID>
     <OrderNumber>${esc(o.name)}</OrderNumber>
     <OrderDate>${new Date().toISOString()}</OrderDate>
+    <LastModified>${new Date().toISOString()}</LastModified>
     <OrderStatus>awaiting_shipment</OrderStatus>
+
+    <CustomerEmail>${esc(email)}</CustomerEmail>
+    <CustomerUsername>${esc(email)}</CustomerUsername>
+
+    <PaymentMethod>Other</PaymentMethod>
+    <RequestedShippingService>Ground</RequestedShippingService>
+    <ShippingMethod>Ground</ShippingMethod>
+
+    <OrderTotal>${money2(orderTotal)}</OrderTotal>
+    <TaxAmount>${money2(taxAmount)}</TaxAmount>
+    <ShippingAmount>${money2(shippingAmount)}</ShippingAmount>
+    <Subtotal>${money2(orderSubtotal)}</Subtotal>
+    <CurrencyCode>${esc(o.currency || "USD")}</CurrencyCode>
+
     <BillTo>
       <Name>${esc([billTo.first_name,billTo.last_name].filter(Boolean).join(" "))}</Name>
       <Street1>${esc(billTo.address1||"")}</Street1>
+      <Street2>${esc(billTo.address2||"")}</Street2>
       <City>${esc(billTo.city||"")}</City>
       <State>${esc(billTo.province_code||"")}</State>
       <PostalCode>${esc(billTo.zip||"")}</PostalCode>
       <Country>${esc(billTo.country_code||"")}</Country>
+      <Phone>${esc(billTo.phone||"")}</Phone>
     </BillTo>
+
     <ShipTo>
       <Name>${esc([shipTo.first_name,shipTo.last_name].filter(Boolean).join(" "))}</Name>
       <Street1>${esc(shipTo.address1||"")}</Street1>
+      <Street2>${esc(shipTo.address2||"")}</Street2>
       <City>${esc(shipTo.city||"")}</City>
       <State>${esc(shipTo.province_code||"")}</State>
       <PostalCode>${esc(shipTo.zip||"")}</PostalCode>
       <Country>${esc(shipTo.country_code||"")}</Country>
+      <Phone>${esc(shipTo.phone||"")}</Phone>
+      <Residential>false</Residential>
     </ShipTo>
-    <Items>${items}</Items>
+
+    <Items>${itemsXml}
+    </Items>
   </Order>
 </Orders>`;
 }
 
+// ---------- auth ----------
 function authOK(req){
   const h = req.headers.authorization || "";
   if (h.startsWith("Basic ")) {
@@ -193,9 +232,9 @@ function authOK(req){
   if (uq && pq && String(uq) === process.env.SS_USER && String(pq) === process.env.SS_PASS) return true;
   return false;
 }
-
 function logSS(req, tag){ console.log(`[SS] ${tag}`, req.method, req.originalUrl, req.headers["user-agent"]||""); }
 
+// ---------- ShipStation endpoint ----------
 function shipstationHandler(req, res) {
   logSS(req,"hit");
   res.set({
@@ -235,6 +274,9 @@ function shipstationHandler(req, res) {
 app.get("/shipstation", shipstationHandler);
 app.post("/shipstation", shipstationHandler);
 app.head("/shipstation", shipstationHandler);
+
+// ---------- health ----------
+app.get("/health", (req,res)=>res.send("ok"));
 
 // ---------- start ----------
 app.listen(process.env.PORT || 8080);
