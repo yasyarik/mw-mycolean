@@ -6,6 +6,11 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
+app.post("/test", express.text({ type: "*/*" }), (req, res) => {
+  console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"] || "");
+  res.send("ok");
+});
+
 function hmacOk(raw, header, secret){
   if(!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
