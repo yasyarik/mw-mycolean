@@ -70,8 +70,7 @@ function transformOrder(order) {
 
     if (parent && kids.length > 0) {
       const parentTotal = toNum(parent.price) * parent.quantity;
-      let qtySum = 0;
-      for (const c of kids) qtySum += c.quantity;
+      let qtySum = 0; for (const c of kids) qtySum += c.quantity;
 
       after.push({ id: parent.id, title: parent.title, sku: parent.sku || null, qty: parent.quantity, unitPrice: 0, parent: true, key: k });
 
@@ -101,7 +100,7 @@ function transformOrder(order) {
 }
 
 // ---------- memory ----------
-const history = [];
+const history = []; // только MATCH
 function remember(entry) { history.push(entry); while (history.length > 50) history.shift(); }
 const last = () => (history.length ? history[history.length - 1] : null);
 
@@ -131,7 +130,12 @@ app.post("/webhooks/orders-create", async (req, res) => {
   res.status(200).send("ok");
 });
 
-// ---------- basic auth for ShipStation ----------
+// ---------- debug & health ----------
+app.get("/debug/last", (req,res)=>res.json(last()));
+app.post("/test", express.text({ type: "*/*" }), (req,res)=>{ console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"]||""); res.send("ok"); });
+app.get("/health", (req,res)=>res.send("ok"));
+
+// ---------- ShipStation (Custom Store XML) ----------
 function basicAuth(req, res, next) {
   if (!process.env.SS_USER || !process.env.SS_PASS) return res.status(503).send("ShipStation auth not configured");
   const h = req.headers.authorization || "";
@@ -140,8 +144,6 @@ function basicAuth(req, res, next) {
   if (u === process.env.SS_USER && p === process.env.SS_PASS) return next();
   return res.status(401).set("WWW-Authenticate","Basic").send("auth");
 }
-
-// ---------- XML builder ----------
 function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function orderToXML(o){
   if (!o) return "<Orders total=\"0\" page=\"1\" pages=\"1\"></Orders>";
@@ -183,22 +185,29 @@ function orderToXML(o){
 </Orders>`;
 }
 
-// ---------- ShipStation endpoints (Custom Store) ----------
+// лог запросов от ShipStation
+function logSS(req, tag){
+  console.log(`[SS] ${tag}`, req.method, req.originalUrl, req.headers["user-agent"]||"");
+}
+
 app.get("/shipstation", basicAuth, (req,res)=>{
-  // Test Connection: ShipStation часто делает просто GET без параметров или с action=test
-  const action = (req.query.action||"").toString().toLowerCase();
-  if (action === "test") {
-    res.type("application/xml").send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
+  logSS(req,"hit");
+  const action = String(req.query.action||"").toLowerCase();
+
+  // ShipStation любит text/xml
+  res.type("text/xml");
+
+  // Проверка соединения
+  if (action === "test" || action === "status") {
+    res.send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
     return;
   }
-  const o = last();
-  res.type("application/xml").send(orderToXML(o));
-});
 
-// ---------- debug & health ----------
-app.get("/debug/last", (req,res)=>res.json(last()));
-app.post("/test", express.text({ type: "*/*" }), (req,res)=>{ console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"]||""); res.send("ok"); });
-app.get("/health", (req,res)=>res.send("ok"));
+  // Экспорт заказов
+  // (их UI часто зовёт без action, а некоторые версии — с action=export)
+  const o = last();
+  res.send(orderToXML(o));
+});
 
 // ---------- start ----------
 app.listen(process.env.PORT || 8080);
