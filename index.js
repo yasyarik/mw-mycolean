@@ -141,15 +141,18 @@ function sum(items){ return items.reduce((s,i)=> s + (i.unitPrice * i.qty), 0); 
 // Полный XML под ShipStation
 function orderToXML(o, page=1, pages=1){
   const total = o ? 1 : 0;
+
   if (!o) {
     return `<?xml version="1.0" encoding="utf-8"?>
-<Orders total="0" page="${page}" pages="${pages}">
-  <Total>0</Total><Page>${page}</Page><Pages>${pages}</Pages>
+<Orders>
+  <Total>0</Total>
+  <Page>${page}</Page>
+  <Pages>${pages}</Pages>
 </Orders>`;
   }
 
-  const children = o.payload.after.filter(i=>!i.parent);
-  const orderSubtotal = sum(children);
+  const children = o.payload.after ? o.payload.after.filter(i=>!i.parent) : [];
+  const orderSubtotal = children.reduce((s,i)=> s + (i.unitPrice * i.qty), 0);
   const shippingAmount = 0;
   const taxAmount = 0;
   const orderTotal = orderSubtotal + shippingAmount + taxAmount;
@@ -157,9 +160,9 @@ function orderToXML(o, page=1, pages=1){
   const itemsXml = children.map(i => `
     <Item>
       <SKU>${esc(i.sku||"")}</SKU>
-      <Name>${esc(i.title)}</Name>
-      <Quantity>${i.qty}</Quantity>
-      <UnitPrice>${money2(i.unitPrice)}</UnitPrice>
+      <Name>${esc(i.title||"")}</Name>
+      <Quantity>${i.qty||0}</Quantity>
+      <UnitPrice>${(Number.isFinite(i.unitPrice)?i.unitPrice:0).toFixed(2)}</UnitPrice>
       <Adjustment>false</Adjustment>
     </Item>`).join("");
 
@@ -168,24 +171,30 @@ function orderToXML(o, page=1, pages=1){
   const email = o.email || "";
 
   return `<?xml version="1.0" encoding="utf-8"?>
-<Orders total="${total}" page="${page}" pages="${pages}">
-  <Total>${total}</Total><Page>${page}</Page><Pages>${pages}</Pages>
+<Orders>
+  <Total>1</Total>
+  <Page>${page}</Page>
+  <Pages>${pages}</Pages>
   <Order>
     <OrderID>${esc(String(o.id))}</OrderID>
-    <OrderNumber>${esc(o.name)}</OrderNumber>
+    <OrderNumber>${esc(o.name||"")}</OrderNumber>
     <OrderDate>${new Date().toISOString()}</OrderDate>
     <LastModified>${new Date().toISOString()}</LastModified>
     <OrderStatus>awaiting_shipment</OrderStatus>
+
     <CustomerEmail>${esc(email)}</CustomerEmail>
     <CustomerUsername>${esc(email)}</CustomerUsername>
+
     <PaymentMethod>Other</PaymentMethod>
     <RequestedShippingService>Ground</RequestedShippingService>
     <ShippingMethod>Ground</ShippingMethod>
-    <OrderTotal>${money2(orderTotal)}</OrderTotal>
-    <TaxAmount>${money2(taxAmount)}</TaxAmount>
-    <ShippingAmount>${money2(shippingAmount)}</ShippingAmount>
-    <Subtotal>${money2(orderSubtotal)}</Subtotal>
+
+    <OrderTotal>${orderTotal.toFixed(2)}</OrderTotal>
+    <TaxAmount>${taxAmount.toFixed(2)}</TaxAmount>
+    <ShippingAmount>${shippingAmount.toFixed(2)}</ShippingAmount>
+    <Subtotal>${orderSubtotal.toFixed(2)}</Subtotal>
     <CurrencyCode>${esc(o.currency || "USD")}</CurrencyCode>
+
     <BillTo>
       <Name>${esc([billTo.first_name,billTo.last_name].filter(Boolean).join(" "))}</Name>
       <Street1>${esc(billTo.address1||"")}</Street1>
@@ -196,6 +205,7 @@ function orderToXML(o, page=1, pages=1){
       <Country>${esc(billTo.country_code||"")}</Country>
       <Phone>${esc(billTo.phone||"")}</Phone>
     </BillTo>
+
     <ShipTo>
       <Name>${esc([shipTo.first_name,shipTo.last_name].filter(Boolean).join(" "))}</Name>
       <Street1>${esc(shipTo.address1||"")}</Street1>
@@ -207,6 +217,7 @@ function orderToXML(o, page=1, pages=1){
       <Phone>${esc(shipTo.phone||"")}</Phone>
       <Residential>false</Residential>
     </ShipTo>
+
     <Items>${itemsXml}
     </Items>
   </Order>
