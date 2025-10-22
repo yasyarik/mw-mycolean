@@ -8,7 +8,6 @@ const app = express();
 
 console.log("MW UP", "secret_len", (process.env.SHOPIFY_WEBHOOK_SECRET || "").length);
 
-// ========== utils ==========
 function hmacOk(raw, header, secret) {
   if (!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -43,7 +42,6 @@ function bundleKey(li) {
   return f2 ? String(f2.value) : null;
 }
 
-// ========== transform ==========
 function transformOrder(order) {
   const before = order.line_items.map(li => ({
     id: li.id, title: li.title, sku: li.sku || null, qty: li.quantity,
@@ -72,7 +70,6 @@ function transformOrder(order) {
       const parentTotal = toNum(parent.price) * parent.quantity;
       let qtySum = 0; for (const c of kids) qtySum += c.quantity;
 
-      // parent -> 0
       after.push({ id: parent.id, title: parent.title, sku: parent.sku || null, qty: parent.quantity, unitPrice: 0, parent: true, key: k });
 
       if (parentTotal > 0 && qtySum > 0) {
@@ -100,12 +97,10 @@ function transformOrder(order) {
   return { before, after };
 }
 
-// ========== memory ==========
-const history = [];    // только MATCH
+const history = [];
 function remember(entry) { history.push(entry); while (history.length > 100) history.shift(); }
 const last = () => (history.length ? history[history.length - 1] : null);
 
-// ========== webhook ==========
 app.post("/webhooks/orders-create", async (req, res) => {
   const raw = await getRawBody(req);
   const hdr = req.headers["x-shopify-hmac-sha256"] || "";
@@ -132,31 +127,15 @@ app.post("/webhooks/orders-create", async (req, res) => {
   res.status(200).send("ok");
 });
 
-// ========== debug & health ==========
 app.get("/debug/last", (req,res)=>res.json(last()));
 app.post("/test", express.text({ type: "*/*" }), (req,res)=>{ console.log("TEST HIT", new Date().toISOString(), req.headers["user-agent"]||""); res.send("ok"); });
 app.get("/health", (req,res)=>res.send("ok"));
 
-// ========== ShipStation (Custom Store XML) ==========
-function basicAuth(req, res, next) {
-  if (!process.env.SS_USER || !process.env.SS_PASS) return res.status(503).send("ShipStation auth not configured");
-  const h = req.headers.authorization || "";
-  if (!h.startsWith("Basic ")) return res.status(401).set("WWW-Authenticate","Basic").send("auth");
-  const [u, p] = Buffer.from(h.slice(6), "base64").toString("utf8").split(":", 2);
-  if (u === process.env.SS_USER && p === process.env.SS_PASS) return next();
-  return res.status(401).set("WWW-Authenticate","Basic").send("auth");
-}
 function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-
 function orderToXML(o){
   if (!o) return "<Orders total=\"0\" page=\"1\" pages=\"1\"></Orders>";
   const items = o.payload.after.filter(i=>!i.parent).map(i=>(
-    `<Item>
-      <SKU>${esc(i.sku||"")}</SKU>
-      <Name>${esc(i.title)}</Name>
-      <Quantity>${i.qty}</Quantity>
-      <UnitPrice>${i.unitPrice.toFixed(2)}</UnitPrice>
-    </Item>`
+    `<Item><SKU>${esc(i.sku||"")}</SKU><Name>${esc(i.title)}</Name><Quantity>${i.qty}</Quantity><UnitPrice>${i.unitPrice.toFixed(2)}</UnitPrice></Item>`
   )).join("");
   const shipTo = o.shipping_address||{};
   const billTo = o.billing_address||{};
@@ -188,45 +167,50 @@ function orderToXML(o){
 </Orders>`;
 }
 
-// лог запросов от SS
-function logSS(req, tag){
-  console.log(`[SS] ${tag}`, req.method, req.originalUrl, req.headers["user-agent"]||"");
+function authOK(req){
+  const h = req.headers.authorization || "";
+  if (h.startsWith("Basic ")) {
+    const [u, p] = Buffer.from(h.slice(6), "base64").toString("utf8").split(":", 2);
+    if (u === process.env.SS_USER && p === process.env.SS_PASS) return true;
+  }
+  const q = req.query || {};
+  const uq = q["SS-UserName"] || q["ss-username"] || q["SS-USERNAME"] || q["username"];
+  const pq = q["SS-Password"] || q["ss-password"] || q["SS-PASSWORD"] || q["password"];
+  if (uq && pq && String(uq) === process.env.SS_USER && String(pq) === process.env.SS_PASS) return true;
+  return false;
 }
 
-// единый обработчик для GET/POST/HEAD
+function logSS(req, tag){ console.log(`[SS] ${tag}`, req.method, req.originalUrl, req.headers["user-agent"]||""); }
+
 function shipstationHandler(req, res) {
-  logSS(req, "hit");
-  res.type("text/xml"); // SS любит text/xml
-  const method = req.method.toUpperCase();
-  if (method === "HEAD") { res.status(200).end(); return; }
+  logSS(req,"hit");
+  res.type("text/xml");
+
+  if (!process.env.SS_USER || !process.env.SS_PASS) { res.status(503).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth not configured</Error>`); return; }
+  if (!authOK(req)) { res.status(401).set("WWW-Authenticate","Basic").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`); return; }
+
+  if (req.method.toUpperCase() === "HEAD") { res.status(200).end(); return; }
 
   const q = Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k.toLowerCase(), String(v)]));
   const action = (q.action || "").toLowerCase();
 
-  // тест соединения / статус
   if (action === "test" || action === "status") {
     res.send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`);
     return;
   }
 
-  // экспорт заказов (action=export) или без action
   let o = last();
-
-  // фильтры по датам (не строго, просто демонстрация)
-  // SS присылает ISO или yyyy-mm-dd hh:mm:ss
   const start = q.start_date ? Date.parse(q.start_date) : null;
   const end   = q.end_date   ? Date.parse(q.end_date)   : null;
   if (o && (start || end)) {
     const created = Date.parse(o.created_at || new Date().toISOString());
-    if ((start && created < start) || (end && created > end)) {
-      o = null;
-    }
+    if ((start && created < start) || (end && created > end)) o = null;
   }
-
   res.send(orderToXML(o));
 }
-app.get("/shipstation", basicAuth, shipstationHandler);
-app.post("/shipstation", basicAuth, shipstationHandler);
 
-// ========== start ==========
+app.get("/shipstation", shipstationHandler);
+app.post("/shipstation", shipstationHandler);
+app.head("/shipstation", shipstationHandler);
+
 app.listen(process.env.PORT || 8080);
