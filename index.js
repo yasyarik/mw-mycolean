@@ -133,7 +133,7 @@ app.post("/webhooks/orders-create", async (req, res) => {
   res.status(200).send("ok");
 });
 
-// ---------- helpers ----------
+// ---------- XML helpers ----------
 function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function money2(v){ return (Number.isFinite(v)? v:0).toFixed(2); }
 function sum(items){ return items.reduce((s,i)=> s + (i.unitPrice * i.qty), 0); }
@@ -176,20 +176,16 @@ function orderToXML(o, page=1, pages=1){
     <OrderDate>${new Date().toISOString()}</OrderDate>
     <LastModified>${new Date().toISOString()}</LastModified>
     <OrderStatus>awaiting_shipment</OrderStatus>
-
     <CustomerEmail>${esc(email)}</CustomerEmail>
     <CustomerUsername>${esc(email)}</CustomerUsername>
-
     <PaymentMethod>Other</PaymentMethod>
     <RequestedShippingService>Ground</RequestedShippingService>
     <ShippingMethod>Ground</ShippingMethod>
-
     <OrderTotal>${money2(orderTotal)}</OrderTotal>
     <TaxAmount>${money2(taxAmount)}</TaxAmount>
     <ShippingAmount>${money2(shippingAmount)}</ShippingAmount>
     <Subtotal>${money2(orderSubtotal)}</Subtotal>
     <CurrencyCode>${esc(o.currency || "USD")}</CurrencyCode>
-
     <BillTo>
       <Name>${esc([billTo.first_name,billTo.last_name].filter(Boolean).join(" "))}</Name>
       <Street1>${esc(billTo.address1||"")}</Street1>
@@ -200,7 +196,6 @@ function orderToXML(o, page=1, pages=1){
       <Country>${esc(billTo.country_code||"")}</Country>
       <Phone>${esc(billTo.phone||"")}</Phone>
     </BillTo>
-
     <ShipTo>
       <Name>${esc([shipTo.first_name,shipTo.last_name].filter(Boolean).join(" "))}</Name>
       <Street1>${esc(shipTo.address1||"")}</Street1>
@@ -212,11 +207,39 @@ function orderToXML(o, page=1, pages=1){
       <Phone>${esc(shipTo.phone||"")}</Phone>
       <Residential>false</Residential>
     </ShipTo>
-
     <Items>${itemsXml}
     </Items>
   </Order>
 </Orders>`;
+}
+
+// sample-order на время Connect
+function buildSampleOrder(){
+  const now = new Date().toISOString();
+  const o = {
+    id: 999000111,
+    name: "#SAMPLE",
+    currency: "USD",
+    email: "sample@mycolean.com",
+    shipping_address: {
+      first_name: "Sample", last_name: "Buyer",
+      address1: "1 Sample Street", address2: "",
+      city: "Austin", province_code: "TX", zip: "73301", country_code: "US", phone: ""
+    },
+    billing_address: {
+      first_name: "Sample", last_name: "Buyer",
+      address1: "1 Sample Street", address2: "",
+      city: "Austin", province_code: "TX", zip: "73301", country_code: "US", phone: ""
+    },
+    payload: {
+      after: [
+        { id: 1, title: "Mycolean Classic 4-Pack", sku: "MYCO-4PK", qty: 1, unitPrice: 49.95, parent: false },
+        { id: 2, title: "Mystery Bottle", sku: "MYCO-MYST", qty: 1, unitPrice: 0.00, parent: false }
+      ]
+    },
+    created_at: now
+  };
+  return o;
 }
 
 // ---------- auth ----------
@@ -259,6 +282,13 @@ function shipstationHandler(req, res) {
 
   // export (или без action)
   let o = last();
+
+  // если нет матчей и включён флаг — отдаём sample, чтобы пройти Connect
+  if (!o && String(process.env.SS_SAMPLE_ON_EMPTY || "").toLowerCase() === "true") {
+    o = buildSampleOrder();
+    console.log("[SS] using SAMPLE order for connect");
+  }
+
   const start = q.start_date ? Date.parse(q.start_date) : null;
   const end   = q.end_date   ? Date.parse(q.end_date)   : null;
   if (o && (start || end)) {
