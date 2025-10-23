@@ -1,7 +1,7 @@
-// index.js (CommonJS)
+// index.js (ESM, works with "type":"module")
 
-const express = require("express");
-const crypto = require("crypto");
+import express from "express";
+import crypto from "crypto";
 
 const app = express();
 
@@ -70,7 +70,6 @@ const statusById = new Map(); // order.id -> 'awaiting_shipment' | 'cancelled'
 const last = () => (history.length ? history[0] : null);
 
 function remember(orderLike) {
-  // нормализуем
   const o = {
     id: orderLike.id,
     name: orderLike.name || `#${orderLike.id}`,
@@ -85,7 +84,7 @@ function remember(orderLike) {
     payload: { after: [] }
   };
 
-  // трансформация в after
+  // трансформация
   o.payload.after = transformOrder(o).after;
 
   // сохранить
@@ -94,7 +93,6 @@ function remember(orderLike) {
   history.unshift(o);
   while (history.length > 200) history.pop();
 
-  // статус по умолчанию
   if (!statusById.has(o.id)) statusById.set(o.id, "awaiting_shipment");
 
   log("MATCH", o.id, o.name, "items:", o.payload.after.length);
@@ -104,7 +102,6 @@ function remember(orderLike) {
 /* ========= bundle/SKIO transform ========= */
 
 function isBundleParentProps(propsMap) {
-  // разные приложения оставляют разные ключи
   return (
     String(propsMap._sb_parent).toLowerCase() === "true" ||
     String(propsMap._bundle_root).toLowerCase() === "true" ||
@@ -123,8 +120,16 @@ function isBundleChildProps(propsMap) {
 function propsKey(li) {
   const p = Object.fromEntries((li.properties || []).map(p => [p.name, p.value]));
   return (
-    String(p._sb_bundle_id || p.bundle_id || p._bundle_id || p.skio_bundle_id || p._sb_key || p.bundle_key || p.skio_bundle_key || "") ||
-    null
+    String(
+      p._sb_bundle_id ||
+        p.bundle_id ||
+        p._bundle_id ||
+        p.skio_bundle_id ||
+        p._sb_key ||
+        p.bundle_key ||
+        p.skio_bundle_key ||
+        ""
+    ) || null
   );
 }
 
@@ -134,7 +139,6 @@ function transformOrder(order) {
   const after = [];
   const handled = new Set();
 
-  // соберём карту props для каждого LI
   const mapProps = li => Object.fromEntries((li.properties || []).map(p => [p.name, p.value]));
 
   // группировка
@@ -160,7 +164,6 @@ function transformOrder(order) {
     if (parent) handled.add(parent.id);
     for (const c of kids) handled.add(c.id);
 
-    // начальное заполнение: родитель как в заказе (его цена будет перераспределена)
     if (parent) {
       after.push({
         id: parent.id,
@@ -186,7 +189,7 @@ function transformOrder(order) {
     }
   }
 
-  // остальные не сгруппированные
+  // остальные (несгруппированные)
   for (const li of items) {
     if (handled.has(li.id)) continue;
     after.push({
@@ -200,7 +203,7 @@ function transformOrder(order) {
     });
   }
 
-  // SKIO-логика: если цена на родителе, а у детей 0 — раздаём цену родителя по детям (по количеству)
+  // SKIO-логика: если цена на родителе, а у детей 0 — раздать цену родителя по детям (по qty)
   for (const key of new Set(after.map(x => x.key).filter(Boolean))) {
     const groupLines = after.filter(x => x.key === key);
     const parentLine = groupLines.find(x => x.parent);
@@ -215,7 +218,6 @@ function transformOrder(order) {
       const parentTotal = toNum(parentLine.unitPrice) * (parentLine.qty || 1);
       const totalChildQty = childLines.reduce((a, c) => a + (c.qty || 1), 0) || 1;
 
-      // распределяем по children (равномерно по qty)
       let rest = Math.round(parentTotal * 100);
       for (let i = 0; i < childLines.length; i++) {
         const c = childLines[i];
@@ -227,11 +229,11 @@ function transformOrder(order) {
         const unit = (c.qty || 1) > 0 ? share / (c.qty || 1) / 100 : 0;
         c.unitPrice = Number(unit.toFixed(2));
       }
-      parentLine.unitPrice = 0; // родитель нулевой
+      parentLine.unitPrice = 0;
     }
   }
 
-  // MOCK подписки по note: "subscription_test=yes" — для ручных тестов без checkout
+  // MOCK подписки по note: "subscription_test=yes"
   const noteStr = String(order.note || "");
   const hasAnyGroup = after.some(x => x.key);
   if (!hasAnyGroup && /subscription_test\s*=\s*yes/i.test(noteStr) && after.length > 0) {
@@ -250,7 +252,7 @@ function transformOrder(order) {
     after.push({
       id: String(li.id) + "-child",
       title: li.title + " (SUB CHILD)",
-      sku: (li.sku ? li.sku + "-CHILD" : "SUB-CHILD"),
+      sku: li.sku ? li.sku + "-CHILD" : "SUB-CHILD",
       qty: li.qty || 1,
       unitPrice: Number((total / (li.qty || 1)).toFixed(2)),
       parent: false,
@@ -267,7 +269,6 @@ app.post("/webhooks/orders-create", (req, res) => {
   const ok = verifyHmac(req);
   if (!ok) return res.status(401).send("BAD HMAC");
   const order = req.body || {};
-  // фильтр по нашей метке: применяем только к превью-теме
   const note = String(order.note || "");
   const themeMark = /__MW_THEME\s*=\s*preview-/i.test(note);
   if (!themeMark) {
@@ -290,7 +291,6 @@ app.post("/webhooks/orders-cancelled", (req, res) => {
     return res.status(200).send("OK");
   }
   statusById.set(order.id, "cancelled");
-  // если заказ ещё не в памяти — добавим, чтобы ShipStation увидел обновление
   if (!history.find(x => x.id === order.id)) remember(order);
   log("CANCEL MATCH", order.id, order.name);
   return res.status(200).send("OK");
@@ -306,7 +306,7 @@ function basicOk(req) {
   const q = req.query || {};
   if (q["SS-UserName"] && q["SS-Password"]) {
     return String(q["SS-UserName"]) === u && String(q["SS-Password"]) === p;
-  }
+    }
   const h = req.get("authorization") || "";
   if (h.startsWith("Basic ")) {
     const [uu, pp] = Buffer.from(h.slice(6), "base64").toString("utf8").split(":", 2);
@@ -347,7 +347,6 @@ function buildOrderXML(o) {
 
   let children = (o.payload && o.payload.after ? o.payload.after.filter(i => !i.parent) : []);
   if (!children.length) {
-    // гарантируем хоть один айтем
     children = [{ id: "FALLBACK", title: "Item", sku: "ITEM", qty: 1, unitPrice: toNum(o.total_price || 0), parent: false }];
   }
 
@@ -423,7 +422,6 @@ app.get("/shipstation", (req, res) => {
     return res.status(401).set("WWW-Authenticate", "Basic").type("application/xml").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`);
   }
 
-  // фильтрация по дате — только если включено SS_STRICT_DATES=true
   const strict = String(process.env.SS_STRICT_DATES || "").toLowerCase() === "true";
   let list = [...history];
 
@@ -463,3 +461,21 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   log("MW listening on", PORT);
 });
+
+/* ========= helpers used by shipstation auth ========= */
+function basicOk(req) {
+  const u = process.env.SS_USER || "";
+  const p = process.env.SS_PASS || "";
+  if (!u || !p) return false;
+
+  const q = req.query || {};
+  if (q["SS-UserName"] && q["SS-Password"]) {
+    return String(q["SS-UserName"]) === u && String(q["SS-Password"]) === p;
+  }
+  const h = req.get("authorization") || "";
+  if (h.startsWith("Basic ")) {
+    const [uu, pp] = Buffer.from(h.slice(6), "base64").toString("utf8").split(":", 2);
+    return uu === u && pp === p;
+  }
+  return false;
+}
