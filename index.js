@@ -38,28 +38,66 @@ function isBundleParent(li){
 }
 function bundleKey(li){
   const p = li.properties || [];
-  const get = n => { const f = p.find(x => x.name === n); return f ? String(f.value) : null; };
+  const get = n => {
+    const f = p.find(x => x.name === n);
+    return f ? String(f.value) : null;
+  };
   let v =
-    get("_sb_bundle_id") || get("bundle_id") || get("_bundle_id") ||
-    get("skio_bundle_id") || get("_sb_key") || get("bundle_key") || get("skio_bundle_key");
+    get("_sb_bundle_id") ||
+    get("bundle_id") ||
+    get("_bundle_id") ||
+    get("skio_bundle_id") ||
+    get("_sb_key") ||
+    get("bundle_key") ||
+    get("skio_bundle_key");
   if (!v) {
     const g = get("_sb_bundle_group");
     if (g) v = String(g).split(" ")[0];
   }
   return v;
 }
-function parseSbComponents(li){
-  const props = li.properties || [];
-  const vals = props
-    .filter(p => p.name === "_sb_bundle_variant_id_qty" || p.name === "_sb_components")
-    .map(p => String(p.value));
-  if (!vals.length) return [];
+function parseSbComponents(li) {
+  const props = Array.isArray(li?.properties) ? li.properties : [];
+  const rawVals = props
+    .filter(p =>
+      ["_sb_bundle_variant_id_qty", "_sb_components", "_sb_child_id_qty"].includes(p.name)
+    )
+    .map(p => String(p.value))
+    .filter(Boolean);
+
   const out = [];
-  for (const v of vals.join(",").split(",")){
-    const m = String(v).trim().match(/^(\d+):(\d+)$/);
-    if (m) out.push({ variantId: m[1], qty: Number(m[2])||0 });
+
+  for (const v of rawVals) {
+    const s = v.trim();
+    if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
+      try {
+        const parsed = JSON.parse(s);
+        const arr = Array.isArray(parsed) ? parsed : [parsed];
+        for (const it of arr) {
+          const vid = String(it.variant_id || it.variantId || "").replace(/^gid:\/\/shopify\/ProductVariant\//, "");
+          const qty = Number(it.qty || it.quantity || it.qty_each || it.count || 0);
+          if (vid && qty > 0) out.push({ variantId: vid, qty });
+        }
+      } catch (_) {}
+    }
   }
-  return out.filter(x => x.qty > 0);
+
+  const flat = rawVals.join("|");
+  if (flat) {
+    const parts = flat.split(/[,;|]/).map(x => x.trim()).filter(Boolean);
+    for (const p of parts) {
+      const m = p.match(/^(?:gid:\/\/shopify\/ProductVariant\/)?(\d+)\s*:\s*(\d+)$/i);
+      if (m) out.push({ variantId: m[1], qty: Number(m[2]) || 0 });
+    }
+  }
+
+  const dedup = new Map();
+  for (const r of out) {
+    if (!r.variantId || r.qty <= 0) continue;
+    const k = r.variantId;
+    dedup.set(k, (dedup.get(k) || 0) + r.qty);
+  }
+  return [...dedup.entries()].map(([variantId, qty]) => ({ variantId, qty }));
 }
 function normState(s){ const v=(s||"").trim(); if(!v) return "ST"; return v.length===2?v:v.slice(0,2).toUpperCase(); }
 function filledAddress(a){
@@ -122,8 +160,7 @@ async function transformOrder(order){
     if(parent) handled.add(parent.id); for(const c of kids) handled.add(c.id);
 
     if(parent && kids.length>0){
-      const totalParent=toNum(parent.price)*(parent.quantity||1);
-      after.push({id:parent.id,title:parent.title,sku:parent.sku||null,qty:parent.quantity||1,unitPrice:0,parent:true,key:k});
+      const totalParent=toNum(parent.price)* (parent.quantity||1);
 
       const pricedKids=[]; const zeroKids=[];
       for(const c of kids){ const p=toNum(c.price); (p>0?pricedKids:zeroKids).push(p>0?{c,p}:c); }
@@ -258,7 +295,10 @@ app.post("/webhooks/orders-create", async (req,res)=>{
       hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
       app_id: order?.app_id,
       tags: order?.tags,
-      liProps: items.map(it => ({ id: it.id, hasProps: !!(it.properties && it.properties.length) }))
+      liProps: items.map(it => ({
+        id: it.id,
+        props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
+      }))
     }));
 
     const tagsStr=String(order?.tags||"");
@@ -304,9 +344,15 @@ app.post("/webhooks/orders-cancelled", async (req,res)=>{
 
 function minimalXML(o){
   if(!o) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
-  const children=(o.payload?.after||[]).filter(i=>!i.parent);
-  const items = (children.length?children:[{id:"FALLBACK",title:"Bundle",sku:"BUNDLE",qty:1,unitPrice:Number(o.total_price||0)}])
-    .map(i=>`
+  let children=(o.payload?.after||[]).filter(i=>!i.parent);
+  if(!children.length){ children=[{id:"FALLBACK",title:"Bundle",sku:"BUNDLE",qty:1,unitPrice:Number(o.total_price||0)}]; }
+  const subtotal=sum(children), tax=0, shipping=0, total=subtotal+tax+shipping;
+  const bill=filledAddress(o.billing_address||{}), ship=filledAddress(o.shipping_address||{});
+  const email=(o.email&&o.email.includes("@"))?o.email:"customer@example.com";
+  const orderDate=fmtShipDate(new Date(o.created_at||Date.now())), lastMod=fmtShipDate(new Date());
+  const status=statusById.get(o.id) || "awaiting_shipment";
+
+  const itemsXml=children.map(i=>`
       <Item>
         <LineItemID>${esc(String(i.id||""))}</LineItemID>
         <SKU>${esc(skuSafe(i,o.id))}</SKU>
@@ -315,13 +361,6 @@ function minimalXML(o){
         <UnitPrice>${money2(Number.isFinite(i.unitPrice)?i.unitPrice:0)}</UnitPrice>
         <Adjustment>false</Adjustment>
       </Item>`).join("");
-
-  const subtotal=sum(children.length?children:[{unitPrice:Number(o.total_price||0),qty:1}]);
-  const tax=0, shipping=0, total=subtotal+tax+shipping;
-  const bill=filledAddress(o.billing_address||{}), ship=filledAddress(o.shipping_address||{});
-  const email=(o.email&&o.email.includes("@"))?o.email:"customer@example.com";
-  const orderDate=fmtShipDate(new Date(o.created_at||Date.now())), lastMod=fmtShipDate(new Date());
-  const status=statusById.get(o.id) || "awaiting_shipment";
 
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
@@ -363,7 +402,7 @@ function minimalXML(o){
         <Phone>${esc(ship.phone)}</Phone>
       </ShipTo>
     </Customer>
-    <Items>${items}
+    <Items>${itemsXml}
     </Items>
   </Order>
 </Orders>`;
@@ -391,7 +430,6 @@ function buildSampleOrder(){
   };
 }
 function shipstationHandler(req,res){
-  console.log("[SS] hit", req.method, req.originalUrl);
   res.set({"Content-Type":"application/xml; charset=utf-8","Cache-Control":"no-store, no-cache, must-revalidate, max-age=0","Pragma":"no-cache","Expires":"0"});
   if(!process.env.SS_USER||!process.env.SS_PASS){ res.status(503).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth not configured</Error>`); return; }
   if(!authOK(req)){ res.status(401).set("WWW-Authenticate","Basic").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`); return; }
@@ -399,6 +437,14 @@ function shipstationHandler(req,res){
   const q=Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k.toLowerCase(),String(v)]));
   const action=(q.action||"").toLowerCase();
   if(action==="test"||action==="status"){ res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`); return; }
+
+  if (q.order_id) {
+    const wanted = String(q.order_id);
+    const found = history.slice().reverse().find(o => String(o.id) === wanted);
+    const xml = minimalXML(found || null);
+    res.status(200).send(xml);
+    return;
+  }
 
   let o=last();
   if(!o && String(process.env.SS_SAMPLE_ON_EMPTY||"").toLowerCase()==="true"){ o=buildSampleOrder(); }
@@ -411,7 +457,6 @@ function shipstationHandler(req,res){
   }
 
   const xml=minimalXML(o);
-  console.log("[SS] xml(export):", xml.slice(0,300).replace(/\s+/g," ").trim());
   res.status(200).send(xml);
 }
 
