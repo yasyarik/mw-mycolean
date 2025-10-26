@@ -124,6 +124,39 @@ function isSubscription(order) {
   if (order?.app_id === SKIO_APP_ID) return true;
   return false;
 }
+function sbLinksFromDiscounts(order){
+  const apps = Array.isArray(order.discount_applications) ? order.discount_applications : [];
+  let parentId = null;
+  const childAppIdx = new Set();
+  apps.forEach((a, idx) => {
+    const blob = [a.title, a.description].filter(Boolean).join(" ");
+    if (/Simple Bundles/i.test(blob)) {
+      const m = blob.match(/ID:\s*(\d+)/i);
+      if (m) parentId = Number(m[1]);
+      childAppIdx.add(idx);
+    }
+  });
+  const items = Array.isArray(order.line_items) ? order.line_items : [];
+  const children = items.filter(li =>
+    Array.isArray(li.discount_allocations) &&
+    li.discount_allocations.some(d => childAppIdx.has(d.discount_application_index))
+  );
+  const parent = items.find(li => Number(li.id) === parentId) || null;
+  if (parent || children.length) return { parent, children };
+  return null;
+}
+function pushLine(after, li, { unitPrice = null, parent = false, key = null } = {}){
+  const price = unitPrice != null ? unitPrice : toNum(li.price);
+  after.push({
+    id: li.id,
+    title: li.title,
+    sku: li.sku || null,
+    qty: li.quantity || 1,
+    unitPrice: price,
+    parent,
+    key
+  });
+}
 
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
 function remember(e){ history.push(e); while(history.length>100) history.shift(); }
@@ -192,8 +225,22 @@ async function transformOrder(order){
     }
   }
 
+  const sbByDiscounts = sbLinksFromDiscounts(order);
+  if (sbByDiscounts) {
+    const { parent, children } = sbByDiscounts;
+    const key = parent ? (bundleKey(parent) || `_sb_${parent.id}`) : "_sb_auto";
+    if (parent) {
+      handled.add(parent.id);
+      pushLine(after, parent, { unitPrice: 0, parent: true, key });
+    }
+    for (const c of children) {
+      handled.add(c.id);
+      pushLine(after, c, { key });
+    }
+  }
+
   const hasAnyGroup = Object.keys(groups).length > 0;
-  if (!hasAnyGroup){
+  if (!hasAnyGroup && !sbByDiscounts){
     for (const li of (order.line_items||[])) {
       const comps = parseSbComponents(li);
       if (!comps.length) continue;
@@ -301,13 +348,12 @@ app.post("/webhooks/orders-create", async (req,res)=>{
       }))
     }));
 
-const inPreview = mark && String(mark.theme||"").startsWith("preview-");
-if (!inPreview) {
-  console.log("skip", order.id, order.name);
-  res.status(200).send("skip");
-  return;
-}
-
+    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
+    if (!inPreview) {
+      console.log("skip", order.id, order.name);
+      res.status(200).send("skip");
+      return;
+    }
 
     const conv=await transformOrder(order);
     remember({
