@@ -228,10 +228,11 @@ app.post("/webhooks/orders-create", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
+
     const mark=pickMark(order);
-    const topic = String(req.headers["x-shopify-topic"] || "");
-    const shop = String(req.headers["x-shopify-shop-domain"] || "");
-    const items = Array.isArray(order?.line_items) ? order.line_items : [];
+    const topic=String(req.headers["x-shopify-topic"]||"");
+    const shop=String(req.headers["x-shopify-shop-domain"]||"");
+    const items=Array.isArray(order?.line_items)?order.line_items:[];
     console.log(JSON.stringify({
       t: Date.now(),
       topic,
@@ -244,7 +245,14 @@ app.post("/webhooks/orders-create", async (req,res)=>{
       liProps: items.map(it => ({ id: it.id, hasProps: !!(it.properties && it.properties.length) }))
     }));
 
-    if(!mark || !String(mark.theme||"").startsWith("preview-")){ console.log("skip",order.id,order.name); res.status(200).send("skip"); return; }
+    const tagsStr=String(order?.tags||"");
+    const allowLive = isSubscription(order) || tagsStr.includes("Simple Bundles 2.0 - Bundle Order");
+    if(!(mark && String(mark.theme||"").startsWith("preview-")) && !allowLive){
+      console.log("skip",order.id,order.name);
+      res.status(200).send("skip");
+      return;
+    }
+
     const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
@@ -256,6 +264,7 @@ app.post("/webhooks/orders-create", async (req,res)=>{
     res.status(200).send("ok");
   }catch(e){ console.error(e); res.status(500).send("err"); }
 });
+
 
 app.post("/webhooks/orders-cancelled", async (req,res)=>{
   try{
