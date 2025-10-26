@@ -124,25 +124,39 @@ function isSubscription(order) {
   if (order?.app_id === SKIO_APP_ID) return true;
   return false;
 }
-function sbLinksFromDiscounts(order){
+function sbDetectFromOrder(order){
+  const items = Array.isArray(order.line_items) ? order.line_items : [];
   const apps = Array.isArray(order.discount_applications) ? order.discount_applications : [];
   let parentId = null;
-  const childAppIdx = new Set();
-  apps.forEach((a, idx) => {
-    const blob = [a.title, a.description].filter(Boolean).join(" ");
-    if (/Simple Bundles/i.test(blob)) {
-      const m = blob.match(/ID:\s*(\d+)/i);
-      if (m) parentId = Number(m[1]);
-      childAppIdx.add(idx);
+  const sbIdx = [];
+  for (let i = 0; i < apps.length; i++) {
+    const a = apps[i];
+    const blob = [a.title, a.description, a.code].filter(Boolean).join(" ");
+    if (a.target_type === "line_item" && /Simple Bundles/i.test(blob)) {
+      sbIdx.push(i);
+      if (!parentId) {
+        const m = blob.match(/ID:\s*(\d+)/i);
+        if (m) parentId = Number(m[1]);
+      }
     }
-  });
-  const items = Array.isArray(order.line_items) ? order.line_items : [];
-  const children = items.filter(li =>
+  }
+  if (sbIdx.length) {
+    const children = items.filter(li =>
+      Array.isArray(li.discount_allocations) &&
+      li.discount_allocations.some(d => sbIdx.includes(d.discount_application_index))
+    );
+    const parent = items.find(li => Number(li.id) === Number(parentId)) || null;
+    if (parent || children.length) return { parent, children };
+  }
+  const tagStr = String(order.tags || "").toLowerCase();
+  const children2 = items.filter(li =>
     Array.isArray(li.discount_allocations) &&
-    li.discount_allocations.some(d => childAppIdx.has(d.discount_application_index))
+    li.discount_allocations.some(d => toNum(d.amount) > 0)
   );
-  const parent = items.find(li => Number(li.id) === parentId) || null;
-  if (parent || children.length) return { parent, children };
+  const rest = items.filter(li => !children2.includes(li));
+  if (tagStr.includes("simple bundles") && children2.length >= 1 && rest.length === 1) {
+    return { parent: rest[0], children: children2 };
+  }
   return null;
 }
 function pushLine(after, li, { unitPrice = null, parent = false, key = null } = {}){
@@ -270,23 +284,22 @@ async function transformOrder(order){
     }
   }
 
-  const sbByDiscounts = sbLinksFromDiscounts(order);
-  if (sbByDiscounts) {
-    const { parent, children } = sbByDiscounts;
+  const sb = sbDetectFromOrder(order);
+  if (sb) {
+    const { parent, children } = sb;
     const key = parent ? (bundleKey(parent) || `_sb_${parent.id}`) : "_sb_auto";
     if (parent) {
       handled.add(parent.id);
-      pushLine(after, parent, { unitPrice: 0, parent: true, key });
     }
     for (const c of children) {
       handled.add(c.id);
       pushLine(after, c, { key });
     }
+    console.log("SB-DETECT", { parent: parent?.id || null, children: children.map(c=>c.id) });
   }
 
   const hasAnyGroup = Object.keys(groups).length > 0;
-  if (!hasAnyGroup && !sbByDiscounts){
-    // старый блок parseSbComponents(...) — оставь как есть
+  if (!hasAnyGroup && !sb){
     for (const li of (order.line_items||[])) {
       const comps = parseSbComponents(li);
       if (!comps.length) continue;
@@ -317,11 +330,9 @@ async function transformOrder(order){
     }
   }
 
-  // plan C: только родитель — пробуем вычитать состав из метаполей товара
   if (after.length===0) {
     const tagStr=String(order?.tags||"").toLowerCase();
     const parentOnly = (order.line_items||[]).length===1;
-    const looksLikeSB = tagStr.includes("simple bundles");
     if (parentOnly) {
       const li = order.line_items[0];
       const comps = await fetchBundleRecipe(li.product_id, li.variant_id);
@@ -336,7 +347,6 @@ async function transformOrder(order){
       }
     }
   }
-
 
   for(const li of (order.line_items||[])){
     if(handled.has(li.id)) continue;
