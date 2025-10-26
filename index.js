@@ -21,6 +21,7 @@ function pickMark(order) {
   if (attrs.__MW_THEME) return { theme: attrs.__MW_THEME, debug: attrs.__MW_DEBUG === "on" };
   return null;
 }
+
 function toNum(x){ const n = Number.parseFloat(String(x||"0")); return Number.isFinite(n)?n:0; }
 function fmtShipDate(d=new Date()){
   const t=new Date(d); const pad=n=>String(n).padStart(2,"0");
