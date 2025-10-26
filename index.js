@@ -301,13 +301,13 @@ app.post("/webhooks/orders-create", async (req,res)=>{
       }))
     }));
 
-    const tagsStr=String(order?.tags||"");
-    const allowLive = isSubscription(order) || tagsStr.includes("Simple Bundles 2.0 - Bundle Order");
-    if(!(mark && String(mark.theme||"").startsWith("preview-")) && !allowLive){
-      console.log("skip",order.id,order.name);
-      res.status(200).send("skip");
-      return;
-    }
+const inPreview = mark && String(mark.theme||"").startsWith("preview-");
+if (!inPreview) {
+  console.log("skip", order.id, order.name);
+  res.status(200).send("skip");
+  return;
+}
+
 
     const conv=await transformOrder(order);
     remember({
