@@ -117,51 +117,141 @@ async function fetchVariantPrice(variantId){
 
 async function transformOrder(order){
   const groups={};
-  for(const li of order.line_items){
+  for(const li of order.line_items||[]){
     const k=bundleKey(li); if(!k) continue;
     if(!groups[k]) groups[k]={parent:null,children:[]};
     if(isBundleParent(li)) groups[k].parent=li; else groups[k].children.push(li);
   }
+
   const after=[]; const handled=new Set();
 
+  // 1) нормальный кейс: есть группы
   for(const [k,g] of Object.entries(groups)){
     const parent=g.parent, kids=g.children;
     if(parent) handled.add(parent.id); for(const c of kids) handled.add(c.id);
 
     if(parent && kids.length>0){
-      const totalParent=toNum(parent.price)*parent.quantity;
-      after.push({id:parent.id,title:parent.title,sku:parent.sku||null,qty:parent.quantity,unitPrice:0,parent:true,key:k});
+      const totalParent=toNum(parent.price)* (parent.quantity||1);
+      after.push({id:parent.id,title:parent.title,sku:parent.sku||null,qty:parent.quantity||1,unitPrice:0,parent:true,key:k});
+
       const pricedKids=[]; const zeroKids=[];
-      for(const c of kids){
-        const p=toNum(c.price);
-        if(p>0){ pricedKids.push({c,p}); }
-        else { zeroKids.push(c); }
-      }
-      if(zeroKids.length>0){
+      for(const c of kids){ const p=toNum(c.price); (p>0?pricedKids:zeroKids).push(p>0?{c,p}:c); }
+
+      if(zeroKids.length){
         for(const zk of zeroKids){
-          let vp=0;
-          const vid=zk.variant_id||zk.variantId||null;
+          let vp=0; const vid=zk.variant_id||zk.variantId||null;
           if(vid) vp=await fetchVariantPrice(vid);
-          pricedKids.push({c:zk,p:vp});
+          pricedKids.push({c:zk,p:toNum(vp)});
         }
       }
-      const anyPrice=pricedKids.some(x=>x.p>0);
-      if(anyPrice){
+
+      if(pricedKids.some(x=>x.p>0)){
         for(const {c,p} of pricedKids){
-          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity,unitPrice:toNum(p),parent:false,key:k});
+          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:toNum(p),parent:false,key:k});
         }
       }else{
-        let qtySum=0; for(const c of kids) qtySum+=c.quantity;
+        let qtySum=kids.reduce((s,c)=>s+(c.quantity||0),0);
+        qtySum=Math.max(1,qtySum);
         let rest=Math.round(totalParent*100);
         for(let i=0;i<kids.length;i++){
           const c=kids[i];
-          const share=i===kids.length-1?rest:Math.round((totalParent*(c.quantity/Math.max(1,qtySum)))*100);
+          const share=i===kids.length-1?rest:Math.round((totalParent*((c.quantity||0)/qtySum))*100);
           rest-=share;
-          const unit=c.quantity>0?share/c.quantity/100:0;
-          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity,unitPrice:Number(unit.toFixed(2)),parent:false,key:k});
+          const unit=(c.quantity||1)>0?share/(c.quantity||1)/100:0;
+          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:Number(unit.toFixed(2)),parent:false,key:k});
         }
       }
     }
+  }
+
+  // 2) parent-only: синтетическая раскладка по свойствам SB2
+  const hasAnyGroup = Object.keys(groups).length > 0;
+  if (!hasAnyGroup){
+    for (const li of (order.line_items||[])) {
+      const comps = parseSbComponents(li);
+      if (!comps.length) continue;
+
+      const priced=[]; let anyPrice=false;
+      for(const c of comps){
+        const vp=await fetchVariantPrice(c.variantId);
+        const price=toNum(vp);
+        if(price>0) anyPrice=true;
+        priced.push({variantId:c.variantId, qty:c.qty, price});
+      }
+
+      if(anyPrice){
+        for(const x of priced){
+          after.push({
+            id: `${li.id}::${x.variantId}`,
+            title: li.title,
+            sku: li.sku || null,
+            qty: x.qty,
+            unitPrice: toNum(x.price),
+            parent: false,
+            key: bundleKey(li) || `_sb_${li.id}`
+          });
+        }
+      }else{
+        const total = toNum(li.price) * (li.quantity || 1);
+        const qtySum = Math.max(1, comps.reduce((s,c)=>s + (c.qty||0), 0));
+        let rest = Math.round(total * 100);
+        for (let i=0;i<comps.length;i++){
+          const c = comps[i];
+          const share = i===comps.length-1 ? rest : Math.round((total * ((c.qty||0)/qtySum)) * 100);
+          rest -= share;
+          const unit = (c.qty||1) > 0 ? share / (c.qty||1) / 100 : 0;
+          after.push({
+            id: `${li.id}::${c.variantId}`,
+            title: li.title,
+            sku: li.sku || null,
+            qty: c.qty||1,
+            unitPrice: Number(unit.toFixed(2)),
+            parent: false,
+            key: bundleKey(li) || `_sb_${li.id}`
+          });
+        }
+      }
+      handled.add(li.id);
+    }
+  }
+
+  // 3) добираем все непройденные строки как обычные товары
+  for(const li of (order.line_items||[])){
+    if(handled.has(li.id)) continue;
+    after.push({
+      id:li.id,
+      title:li.title,
+      sku:li.sku||null,
+      qty:li.quantity||1,
+      unitPrice:toNum(li.price),
+      parent:false,
+      key:bundleKey(li)
+    });
+  }
+
+  // 4) железный fallback — пусто быть не может
+  if (after.length===0){
+    for(const li of (order.line_items||[])){
+      const base = toNum(li.price);
+      const fetched = li.variant_id ? await fetchVariantPrice(li.variant_id) : 0;
+      const price = base>0 ? base : toNum(fetched);
+      after.push({
+        id: li.id,
+        title: li.title,
+        sku: li.sku || null,
+        qty: li.quantity || 1,
+        unitPrice: price,
+        parent: false,
+        key: bundleKey(li)
+      });
+    }
+  }
+
+  return { after };
+}
+
+
+    
   }
 
   const hasAnyGroup = Object.keys(groups).length > 0;
