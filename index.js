@@ -22,6 +22,7 @@ function pickMark(order) {
   return null;
 }
 
+
 function toNum(x){ const n = Number.parseFloat(String(x||"0")); return Number.isFinite(n)?n:0; }
 function fmtShipDate(d=new Date()){
   const t=new Date(d); const pad=n=>String(n).padStart(2,"0");
