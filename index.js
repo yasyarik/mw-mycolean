@@ -177,6 +177,51 @@ async function fetchVariantPrice(variantId){
   variantPriceCache.set(key,price);
   return price;
 }
+async function fetchBundleRecipe(productId, variantId){
+  const shop=process.env.SHOPIFY_SHOP;
+  const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if(!shop||!token||!productId) return null;
+
+  const tryKeys=[
+    {ns:"simple_bundles_2_0", key:"components"},
+    {ns:"simple_bundles",     key:"components"},
+    {ns:"simplebundles",      key:"components"},
+    {ns:"bundles",            key:"components"},
+  ];
+
+  const gql = `
+  query($pid: ID!, $vKeys: [HasMetafieldsIdentifier!]!) {
+    product(id: $pid) {
+      id
+      metafields(identifiers: $vKeys){ namespace key value type }
+    }
+  }`;
+
+  const identifiers = tryKeys.map(k=>({namespace:k.ns,key:k.key}));
+  const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`,{
+    method:"POST",
+    headers:{ "X-Shopify-Access-Token":token, "Content-Type":"application/json" },
+    body: JSON.stringify({ query:gql, variables:{ pid:`gid://shopify/Product/${productId}`, vKeys:identifiers } })
+  });
+  if(!r.ok) return null;
+  const j = await r.json();
+  const mfs = j?.data?.product?.metafields || [];
+  const mf = mfs.find(m=>m?.value);
+  if(!mf) return null;
+
+  let parsed=null;
+  try{ parsed = JSON.parse(mf.value); }catch(_){}
+  if(!parsed) return null;
+
+  const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.components)?parsed.components:[]);
+  const out=[];
+  for(const it of list){
+    const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//,"");
+    const qty = Number(it.quantity || it.qty || it.qty_each || 0);
+    if(vid && qty>0) out.push({ variantId: vid, qty });
+  }
+  return out.length ? out : null;
+}
 
 async function transformOrder(order){
   const groups={};
@@ -241,10 +286,10 @@ async function transformOrder(order){
 
   const hasAnyGroup = Object.keys(groups).length > 0;
   if (!hasAnyGroup && !sbByDiscounts){
+    // старый блок parseSbComponents(...) — оставь как есть
     for (const li of (order.line_items||[])) {
       const comps = parseSbComponents(li);
       if (!comps.length) continue;
-
       const priced=[]; let anyPrice=false;
       for(const c of comps){
         const vp=await fetchVariantPrice(c.variantId);
@@ -252,42 +297,46 @@ async function transformOrder(order){
         if(price>0) anyPrice=true;
         priced.push({variantId:c.variantId, qty:c.qty, price});
       }
-
       if(anyPrice){
         for(const x of priced){
-          after.push({
-            id: `${li.id}::${x.variantId}`,
-            title: li.title,
-            sku: li.sku || null,
-            qty: x.qty,
-            unitPrice: toNum(x.price),
-            parent: false,
-            key: bundleKey(li) || `_sb_${li.id}`
-          });
+          after.push({ id:`${li.id}::${x.variantId}`, title:li.title, sku:li.sku||null, qty:x.qty, unitPrice:toNum(x.price), parent:false, key:bundleKey(li)||`_sb_${li.id}` });
         }
       }else{
-        const total = toNum(li.price) * (li.quantity || 1);
-        const qtySum = Math.max(1, comps.reduce((s,c)=>s + (c.qty||0), 0));
-        let rest = Math.round(total * 100);
-        for (let i=0;i<comps.length;i++){
-          const c = comps[i];
-          const share = i===comps.length-1 ? rest : Math.round((total * ((c.qty||0)/qtySum)) * 100);
-          rest -= share;
-          const unit = (c.qty||1) > 0 ? share / (c.qty||1) / 100 : 0;
-          after.push({
-            id: `${li.id}::${c.variantId}`,
-            title: li.title,
-            sku: li.sku || null,
-            qty: c.qty||1,
-            unitPrice: Number(unit.toFixed(2)),
-            parent: false,
-            key: bundleKey(li) || `_sb_${li.id}`
-          });
+        const total=toNum(li.price)*(li.quantity||1);
+        const qtySum=Math.max(1, comps.reduce((s,c)=>s+(c.qty||0),0));
+        let rest=Math.round(total*100);
+        for(let i=0;i<comps.length;i++){
+          const c=comps[i];
+          const share=i===comps.length-1?rest:Math.round((total*((c.qty||0)/qtySum))*100);
+          rest-=share;
+          const unit=(c.qty||1)>0?share/(c.qty||1)/100:0;
+          after.push({ id:`${li.id}::${c.variantId}`, title:li.title, sku:li.sku||null, qty:c.qty||1, unitPrice:Number(unit.toFixed(2)), parent:false, key:bundleKey(li)||`_sb_${li.id}` });
         }
       }
       handled.add(li.id);
     }
   }
+
+  // plan C: только родитель — пробуем вычитать состав из метаполей товара
+  if (after.length===0) {
+    const tagStr=String(order?.tags||"").toLowerCase();
+    const parentOnly = (order.line_items||[]).length===1;
+    const looksLikeSB = tagStr.includes("simple bundles");
+    if (parentOnly) {
+      const li = order.line_items[0];
+      const comps = await fetchBundleRecipe(li.product_id, li.variant_id);
+      if (Array.isArray(comps) && comps.length) {
+        handled.add(li.id);
+        after.push({ id:li.id, title:li.title, sku:li.sku||null, qty:li.quantity||1, unitPrice:0, parent:true, key:bundleKey(li)||`_sb_${li.id}` });
+        for (const c of comps){
+          const vp = await fetchVariantPrice(c.variantId);
+          const price = toNum(vp);
+          after.push({ id:`${li.id}::${c.variantId}`, title:li.title, sku:li.sku||null, qty:(c.qty||1)*(li.quantity||1), unitPrice:price, parent:false, key:bundleKey(li)||`_sb_${li.id}` });
+        }
+      }
+    }
+  }
+
 
   for(const li of (order.line_items||[])){
     if(handled.has(li.id)) continue;
