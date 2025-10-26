@@ -60,6 +60,15 @@ function skuSafe(i, orderId){
   const base=i.id?String(i.id):(i.title?i.title.replace(/\s+/g,"-").slice(0,24):"ITEM");
   return `MW-${orderId}-${base}`;
 }
+function isSubscription(order) {
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  if (items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id)) return true;
+  const tags = String(order?.tags || "").toLowerCase();
+  if (tags.includes("subscription")) return true;
+  const SKIO_APP_ID = 580111;
+  if (order?.app_id === SKIO_APP_ID) return true;
+  return false;
+}
 
 // ========== memory
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
@@ -111,6 +120,21 @@ app.post("/webhooks/orders-create", async (req,res)=>{
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
     const mark=pickMark(order);
+    const topic = String(req.headers["x-shopify-topic"] || "");
+const shop = String(req.headers["x-shopify-shop-domain"] || "");
+const items = Array.isArray(order?.line_items) ? order.line_items : [];
+console.log(JSON.stringify({
+  t: Date.now(),
+  topic,
+  shop,
+  order_id: order?.id,
+  sub: isSubscription(order) ? 1 : 0,
+  hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
+  app_id: order?.app_id,
+  tags: order?.tags,
+  liProps: items.map(it => ({ id: it.id, hasProps: !!(it.properties && it.properties.length) }))
+}));
+
     if(!mark || !String(mark.theme||"").startsWith("preview-")){ console.log("skip",order.id,order.name); res.status(200).send("skip"); return; }
     const conv=transformOrder(order);
     remember({
