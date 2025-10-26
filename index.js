@@ -38,12 +38,29 @@ function isBundleParent(li){
   return false;
 }
 function bundleKey(li){
-  const p=li.properties||[];
-  const f1=p.find(x=>["_sb_bundle_id","bundle_id","_bundle_id","skio_bundle_id"].includes(x.name));
-  if (f1) return String(f1.value);
-  const f2=p.find(x=>["_sb_key","bundle_key","skio_bundle_key"].includes(x.name));
-  return f2?String(f2.value):null;
+  const p = li.properties || [];
+  const get = n => {
+    const f = p.find(x => x.name === n);
+    return f ? String(f.value) : null;
+  };
+
+  let v =
+    get("_sb_bundle_id") ||
+    get("bundle_id") ||
+    get("_bundle_id") ||
+    get("skio_bundle_id") ||
+    get("_sb_key") ||
+    get("bundle_key") ||
+    get("skio_bundle_key");
+
+  if (!v) {
+    const g = get("_sb_bundle_group");
+    if (g) v = String(g).split(" ")[0]; // "d1b1e22b (1/3)" -> "d1b1e22b"
+  }
+
+  return v;
 }
+
 function normState(s){ const v=(s||"").trim(); if(!v) return "ST"; return v.length===2?v:v.slice(0,2).toUpperCase(); }
 function filledAddress(a){
   const d=v=>(v&&String(v).trim())?String(v):"";
