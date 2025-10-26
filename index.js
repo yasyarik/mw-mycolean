@@ -6,7 +6,6 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
-// ========== utils
 function hmacOk(raw, header, secret) {
   if (!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -43,7 +42,6 @@ function bundleKey(li){
     const f = p.find(x => x.name === n);
     return f ? String(f.value) : null;
   };
-
   let v =
     get("_sb_bundle_id") ||
     get("bundle_id") ||
@@ -52,15 +50,25 @@ function bundleKey(li){
     get("_sb_key") ||
     get("bundle_key") ||
     get("skio_bundle_key");
-
   if (!v) {
     const g = get("_sb_bundle_group");
-    if (g) v = String(g).split(" ")[0]; // "d1b1e22b (1/3)" -> "d1b1e22b"
+    if (g) v = String(g).split(" ")[0];
   }
-
   return v;
 }
-
+function parseSbComponents(li){
+  const props = li.properties || [];
+  const vals = props
+    .filter(p => p.name === "_sb_bundle_variant_id_qty" || p.name === "_sb_components")
+    .map(p => String(p.value));
+  if (!vals.length) return [];
+  const out = [];
+  for (const v of vals.join(",").split(",")){
+    const m = String(v).trim().match(/^(\d+):(\d+)$/);
+    if (m) out.push({ variantId: m[1], qty: Number(m[2])||0 });
+  }
+  return out.filter(x => x.qty > 0);
+}
 function normState(s){ const v=(s||"").trim(); if(!v) return "ST"; return v.length===2?v:v.slice(0,2).toUpperCase(); }
 function filledAddress(a){
   const d=v=>(v&&String(v).trim())?String(v):"";
@@ -87,13 +95,27 @@ function isSubscription(order) {
   return false;
 }
 
-// ========== memory
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
 function remember(e){ history.push(e); while(history.length>100) history.shift(); }
 const statusById=new Map();
+const variantPriceCache=new Map();
 
-// ========== transform (parent → 0$, children → цена)
-function transformOrder(order){
+async function fetchVariantPrice(variantId){
+  const key=String(variantId);
+  if(variantPriceCache.has(key)) return variantPriceCache.get(key);
+  const shop=process.env.SHOPIFY_SHOP;
+  const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if(!shop||!token) return 0;
+  const url=`https://${shop}/admin/api/2025-01/variants/${key}.json`;
+  const r=await fetch(url,{headers:{"X-Shopify-Access-Token":token,"Content-Type":"application/json"}});
+  if(!r.ok) return 0;
+  const j=await r.json();
+  const price=toNum(j?.variant?.price);
+  variantPriceCache.set(key,price);
+  return price;
+}
+
+async function transformOrder(order){
   const groups={};
   for(const li of order.line_items){
     const k=bundleKey(li); if(!k) continue;
@@ -101,27 +123,98 @@ function transformOrder(order){
     if(isBundleParent(li)) groups[k].parent=li; else groups[k].children.push(li);
   }
   const after=[]; const handled=new Set();
+
   for(const [k,g] of Object.entries(groups)){
     const parent=g.parent, kids=g.children;
     if(parent) handled.add(parent.id); for(const c of kids) handled.add(c.id);
+
     if(parent && kids.length>0){
-      const total=toNum(parent.price)*parent.quantity;
-      let qtySum=0; for(const c of kids) qtySum+=c.quantity;
+      const totalParent=toNum(parent.price)*parent.quantity;
       after.push({id:parent.id,title:parent.title,sku:parent.sku||null,qty:parent.quantity,unitPrice:0,parent:true,key:k});
-      if(total>0 && qtySum>0){
-        let rest=Math.round(total*100);
+      const pricedKids=[]; const zeroKids=[];
+      for(const c of kids){
+        const p=toNum(c.price);
+        if(p>0){ pricedKids.push({c,p}); }
+        else { zeroKids.push(c); }
+      }
+      if(zeroKids.length>0){
+        for(const zk of zeroKids){
+          let vp=0;
+          const vid=zk.variant_id||zk.variantId||null;
+          if(vid) vp=await fetchVariantPrice(vid);
+          pricedKids.push({c:zk,p:vp});
+        }
+      }
+      const anyPrice=pricedKids.some(x=>x.p>0);
+      if(anyPrice){
+        for(const {c,p} of pricedKids){
+          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity,unitPrice:toNum(p),parent:false,key:k});
+        }
+      }else{
+        let qtySum=0; for(const c of kids) qtySum+=c.quantity;
+        let rest=Math.round(totalParent*100);
         for(let i=0;i<kids.length;i++){
           const c=kids[i];
-          const share=i===kids.length-1?rest:Math.round((total*(c.quantity/qtySum))*100);
+          const share=i===kids.length-1?rest:Math.round((totalParent*(c.quantity/Math.max(1,qtySum)))*100);
           rest-=share;
           const unit=c.quantity>0?share/c.quantity/100:0;
           after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity,unitPrice:Number(unit.toFixed(2)),parent:false,key:k});
         }
-      } else {
-        for(const c of kids){ after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity,unitPrice:toNum(c.price),parent:false,key:k}); }
       }
     }
   }
+
+  const hasAnyGroup = Object.keys(groups).length > 0;
+
+  if (!hasAnyGroup) {
+    for (const li of order.line_items) {
+      const comps = parseSbComponents(li);
+      if (!comps.length) continue;
+      const priced=[]; let allZero=true;
+      for(const c of comps){
+        const vp=await fetchVariantPrice(c.variantId);
+        const price=toNum(vp);
+        if(price>0) allZero=false;
+        priced.push({variantId:c.variantId, qty:c.qty, price});
+      }
+      if(!allZero){
+        for(const x of priced){
+          after.push({
+            id: `${li.id}::${x.variantId}`,
+            title: li.title,
+            sku: li.sku || null,
+            qty: x.qty,
+            unitPrice: toNum(x.price),
+            parent: false,
+            key: bundleKey(li) || `_sb_${li.id}`
+          });
+        }
+      }else{
+        const total = toNum(li.price) * (li.quantity || 1);
+        const qtySum = comps.reduce((s,c)=>s + c.qty, 0);
+        if (qtySum > 0){
+          let rest = Math.round(total * 100);
+          for (let i=0;i<comps.length;i++){
+            const c = comps[i];
+            const share = i===comps.length-1 ? rest : Math.round((total * (c.qty/qtySum)) * 100);
+            rest -= share;
+            const unit = c.qty > 0 ? share / c.qty / 100 : 0;
+            after.push({
+              id: `${li.id}::${c.variantId}`,
+              title: li.title,
+              sku: li.sku || null,
+              qty: c.qty,
+              unitPrice: Number(unit.toFixed(2)),
+              parent: false,
+              key: bundleKey(li) || `_sb_${li.id}`
+            });
+          }
+        }
+      }
+      handled.add(li.id);
+    }
+  }
+
   for(const li of order.line_items){
     if(handled.has(li.id)) continue;
     after.push({id:li.id,title:li.title,sku:li.sku||null,qty:li.quantity,unitPrice:toNum(li.price),parent:false,key:bundleKey(li)});
@@ -129,7 +222,6 @@ function transformOrder(order){
   return { after };
 }
 
-// ========== webhooks
 app.post("/webhooks/orders-create", async (req,res)=>{
   try{
     const raw=await getRawBody(req);
@@ -138,22 +230,22 @@ app.post("/webhooks/orders-create", async (req,res)=>{
     const order=JSON.parse(raw.toString("utf8"));
     const mark=pickMark(order);
     const topic = String(req.headers["x-shopify-topic"] || "");
-const shop = String(req.headers["x-shopify-shop-domain"] || "");
-const items = Array.isArray(order?.line_items) ? order.line_items : [];
-console.log(JSON.stringify({
-  t: Date.now(),
-  topic,
-  shop,
-  order_id: order?.id,
-  sub: isSubscription(order) ? 1 : 0,
-  hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
-  app_id: order?.app_id,
-  tags: order?.tags,
-  liProps: items.map(it => ({ id: it.id, hasProps: !!(it.properties && it.properties.length) }))
-}));
+    const shop = String(req.headers["x-shopify-shop-domain"] || "");
+    const items = Array.isArray(order?.line_items) ? order.line_items : [];
+    console.log(JSON.stringify({
+      t: Date.now(),
+      topic,
+      shop,
+      order_id: order?.id,
+      sub: isSubscription(order) ? 1 : 0,
+      hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
+      app_id: order?.app_id,
+      tags: order?.tags,
+      liProps: items.map(it => ({ id: it.id, hasProps: !!(it.properties && it.properties.length) }))
+    }));
 
     if(!mark || !String(mark.theme||"").startsWith("preview-")){ console.log("skip",order.id,order.name); res.status(200).send("skip"); return; }
-    const conv=transformOrder(order);
+    const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
       email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
@@ -186,7 +278,6 @@ app.post("/webhooks/orders-cancelled", async (req,res)=>{
   }catch(e){ console.error(e); res.status(500).send("err"); }
 });
 
-// ========== XML feed
 function minimalXML(o){
   if(!o) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
   let children=(o.payload?.after||[]).filter(i=>!i.parent);
@@ -209,6 +300,13 @@ function minimalXML(o){
 
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
+  <Order>
+    <Order>
+    </Order>
+  </Order>
+</Orders>`.replace(
+    "<Order>\n    </Order>",
+    `
   <Order>
     <OrderID>${esc(String(o.id))}</OrderID>
     <OrderNumber>${esc(o.name || String(o.id))}</OrderNumber>
@@ -249,11 +347,10 @@ function minimalXML(o){
     </Customer>
     <Items>${itemsXml}
     </Items>
-  </Order>
-</Orders>`;
+  </Order>`
+  );
 }
 
-// ========== ShipStation handler
 function authOK(req){
   const h=req.headers.authorization||"";
   if(h.startsWith("Basic ")){
