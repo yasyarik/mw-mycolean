@@ -64,9 +64,7 @@ function parseSbComponents(li) {
     )
     .map(p => String(p.value))
     .filter(Boolean);
-
   const out = [];
-
   for (const v of rawVals) {
     const s = v.trim();
     if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
@@ -81,7 +79,6 @@ function parseSbComponents(li) {
       } catch (_) {}
     }
   }
-
   const flat = rawVals.join("|");
   if (flat) {
     const parts = flat.split(/[,;|]/).map(x => x.trim()).filter(Boolean);
@@ -90,7 +87,6 @@ function parseSbComponents(li) {
       if (m) out.push({ variantId: m[1], qty: Number(m[2]) || 0 });
     }
   }
-
   const dedup = new Map();
   for (const r of out) {
     if (!r.variantId || r.qty <= 0) continue;
@@ -126,36 +122,25 @@ function isSubscription(order) {
 }
 function sbDetectFromOrder(order){
   const items = Array.isArray(order.line_items) ? order.line_items : [];
-  const apps = Array.isArray(order.discount_applications) ? order.discount_applications : [];
-  let parentId = null;
-  const sbIdx = [];
-  for (let i = 0; i < apps.length; i++) {
-    const a = apps[i];
-    const blob = [a.title, a.description, a.code].filter(Boolean).join(" ");
-    if (a.target_type === "line_item" && /Simple Bundles/i.test(blob)) {
-      sbIdx.push(i);
-      if (!parentId) {
-        const m = blob.match(/ID:\s*(\d+)/i);
-        if (m) parentId = Number(m[1]);
-      }
-    }
-  }
-  if (sbIdx.length) {
-    const children = items.filter(li =>
-      Array.isArray(li.discount_allocations) &&
-      li.discount_allocations.some(d => sbIdx.includes(d.discount_application_index))
-    );
-    const parent = items.find(li => Number(li.id) === Number(parentId)) || null;
-    if (parent || children.length) return { parent, children };
-  }
   const tagStr = String(order.tags || "").toLowerCase();
-  const children2 = items.filter(li =>
-    Array.isArray(li.discount_allocations) &&
-    li.discount_allocations.some(d => toNum(d.amount) > 0)
-  );
-  const rest = items.filter(li => !children2.includes(li));
-  if (tagStr.includes("simple bundles") && children2.length >= 1 && rest.length === 1) {
-    return { parent: rest[0], children: children2 };
+  if (!items.length) return null;
+  const epsilon = 0.00001;
+  const daSum = li => (Array.isArray(li.discount_allocations) ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0) : 0);
+  const zeroed = li => (daSum(li) >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
+  const children = items.filter(li => zeroed(li));
+  const parents = items.filter(li => !zeroed(li));
+  if (children.length && parents.length === 1) {
+    return { parent: parents[0], children };
+  }
+  if (children.length && tagStr.includes("simple bundles")) {
+    return { parent: null, children };
+  }
+  const withPrice = items.filter(li => toNum(li.price) > 0);
+  const maxPrice = withPrice.length ? Math.max(...withPrice.map(li => toNum(li.price))) : 0;
+  const parentGuess = withPrice.find(li => toNum(li.price) === maxPrice) || null;
+  if (tagStr.includes("simple bundles") && parentGuess && items.length > 1) {
+    const rest = items.filter(li => li !== parentGuess);
+    return { parent: parentGuess, children: rest };
   }
   return null;
 }
@@ -195,14 +180,12 @@ async function fetchBundleRecipe(productId, variantId){
   const shop=process.env.SHOPIFY_SHOP;
   const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
   if(!shop||!token||!productId) return null;
-
   const tryKeys=[
     {ns:"simple_bundles_2_0", key:"components"},
     {ns:"simple_bundles",     key:"components"},
     {ns:"simplebundles",      key:"components"},
     {ns:"bundles",            key:"components"},
   ];
-
   const gql = `
   query($pid: ID!, $vKeys: [HasMetafieldsIdentifier!]!) {
     product(id: $pid) {
@@ -210,7 +193,6 @@ async function fetchBundleRecipe(productId, variantId){
       metafields(identifiers: $vKeys){ namespace key value type }
     }
   }`;
-
   const identifiers = tryKeys.map(k=>({namespace:k.ns,key:k.key}));
   const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`,{
     method:"POST",
@@ -222,11 +204,9 @@ async function fetchBundleRecipe(productId, variantId){
   const mfs = j?.data?.product?.metafields || [];
   const mf = mfs.find(m=>m?.value);
   if(!mf) return null;
-
   let parsed=null;
   try{ parsed = JSON.parse(mf.value); }catch(_){}
   if(!parsed) return null;
-
   const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.components)?parsed.components:[]);
   const out=[];
   for(const it of list){
@@ -244,19 +224,14 @@ async function transformOrder(order){
     if(!groups[k]) groups[k]={parent:null,children:[]};
     if(isBundleParent(li)) groups[k].parent=li; else groups[k].children.push(li);
   }
-
   const after=[]; const handled=new Set();
-
   for(const [k,g] of Object.entries(groups)){
     const parent=g.parent, kids=g.children;
     if(parent) handled.add(parent.id); for(const c of kids) handled.add(c.id);
-
     if(parent && kids.length>0){
       const totalParent=toNum(parent.price)* (parent.quantity||1);
-
       const pricedKids=[]; const zeroKids=[];
       for(const c of kids){ const p=toNum(c.price); (p>0?pricedKids:zeroKids).push(p>0?{c,p}:c); }
-
       if(zeroKids.length){
         for(const zk of zeroKids){
           let vp=0; const vid=zk.variant_id||zk.variantId||null;
@@ -264,7 +239,6 @@ async function transformOrder(order){
           pricedKids.push({c:zk,p:toNum(vp)});
         }
       }
-
       if(pricedKids.some(x=>x.p>0)){
         for(const {c,p} of pricedKids){
           after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:toNum(p),parent:false,key:k});
@@ -283,21 +257,17 @@ async function transformOrder(order){
       }
     }
   }
-
   const sb = sbDetectFromOrder(order);
   if (sb) {
     const { parent, children } = sb;
     const key = parent ? (bundleKey(parent) || `_sb_${parent.id}`) : "_sb_auto";
-    if (parent) {
-      handled.add(parent.id);
-    }
+    if (parent) handled.add(parent.id);
     for (const c of children) {
       handled.add(c.id);
       pushLine(after, c, { key });
     }
     console.log("SB-DETECT", { parent: parent?.id || null, children: children.map(c=>c.id) });
   }
-
   const hasAnyGroup = Object.keys(groups).length > 0;
   if (!hasAnyGroup && !sb){
     for (const li of (order.line_items||[])) {
@@ -329,9 +299,7 @@ async function transformOrder(order){
       handled.add(li.id);
     }
   }
-
   if (after.length===0) {
-    const tagStr=String(order?.tags||"").toLowerCase();
     const parentOnly = (order.line_items||[]).length===1;
     if (parentOnly) {
       const li = order.line_items[0];
@@ -347,7 +315,6 @@ async function transformOrder(order){
       }
     }
   }
-
   for(const li of (order.line_items||[])){
     if(handled.has(li.id)) continue;
     after.push({
@@ -360,7 +327,6 @@ async function transformOrder(order){
       key:bundleKey(li)
     });
   }
-
   if (after.length===0){
     for(const li of (order.line_items||[])){
       const base = toNum(li.price);
@@ -377,7 +343,6 @@ async function transformOrder(order){
       });
     }
   }
-
   return { after };
 }
 
@@ -387,7 +352,6 @@ app.post("/webhooks/orders-create", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
-
     const mark=pickMark(order);
     const topic=String(req.headers["x-shopify-topic"]||"");
     const shop=String(req.headers["x-shopify-shop-domain"]||"");
@@ -406,14 +370,12 @@ app.post("/webhooks/orders-create", async (req,res)=>{
         props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
       }))
     }));
-
     const inPreview = mark && String(mark.theme||"").startsWith("preview-");
     if (!inPreview) {
       console.log("skip", order.id, order.name);
       res.status(200).send("skip");
       return;
     }
-
     const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
@@ -456,7 +418,6 @@ function minimalXML(o){
   const email=(o.email&&o.email.includes("@"))?o.email:"customer@example.com";
   const orderDate=fmtShipDate(new Date(o.created_at||Date.now())), lastMod=fmtShipDate(new Date());
   const status=statusById.get(o.id) || "awaiting_shipment";
-
   const itemsXml=children.map(i=>`
       <Item>
         <LineItemID>${esc(String(i.id||""))}</LineItemID>
@@ -466,7 +427,6 @@ function minimalXML(o){
         <UnitPrice>${money2(Number.isFinite(i.unitPrice)?i.unitPrice:0)}</UnitPrice>
         <Adjustment>false</Adjustment>
       </Item>`).join("");
-
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
   <Order>
@@ -489,7 +449,7 @@ function minimalXML(o){
         <Phone>${esc(bill.phone)}</Phone>
         <Email>${esc(email)}</Email>
         <Address1>${esc(bill.address1)}</Address1>
-        <Address2>${esc(bill.address2)}</Address2>
+        <Address2>${esc(bill.address2)}</Address2>}
         <City>${esc(bill.city)}</City>
         <State>${esc(bill.state)}</State>
         <PostalCode>${esc(bill.zip)}</PostalCode>
@@ -538,11 +498,9 @@ function shipstationHandler(req,res){
   res.set({"Content-Type":"application/xml; charset=utf-8","Cache-Control":"no-store, no-cache, must-revalidate, max-age=0","Pragma":"no-cache","Expires":"0"});
   if(!process.env.SS_USER||!process.env.SS_PASS){ res.status(503).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth not configured</Error>`); return; }
   if(!authOK(req)){ res.status(401).set("WWW-Authenticate","Basic").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`); return; }
-
   const q=Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k.toLowerCase(),String(v)]));
   const action=(q.action||"").toLowerCase();
   if(action==="test"||action==="status"){ res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`); return; }
-
   if (q.order_id) {
     const wanted = String(q.order_id);
     const found = history.slice().reverse().find(o => String(o.id) === wanted);
@@ -550,17 +508,14 @@ function shipstationHandler(req,res){
     res.status(200).send(xml);
     return;
   }
-
   let o=last();
   if(!o && String(process.env.SS_SAMPLE_ON_EMPTY||"").toLowerCase()==="true"){ o=buildSampleOrder(); }
-
   const strict=String(process.env.SS_STRICT_DATES||"").toLowerCase()==="true";
   if(o && strict){
     const start=q.start_date?Date.parse(q.start_date):null;
     const end=q.end_date?Date.parse(q.end_date):null;
     if((start && Date.parse(o.created_at)<start) || (end && Date.parse(o.created_at)>end)){ o=null; }
   }
-
   const xml=minimalXML(o);
   res.status(200).send(xml);
 }
