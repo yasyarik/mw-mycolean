@@ -13,14 +13,23 @@ function hmacOk(raw, header, secret) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 function pickMark(order) {
-  const note = String(order.note || "");
+  const note = String(order?.note || "");
   const mT = note.match(/__MW_THEME\s*=\s*([^\s;]+)/i);
   const mD = note.match(/__MW_DEBUG\s*=\s*([^\s;]+)/i);
   if (mT) return { theme: mT[1], debug: !!(mD && mD[1].toLowerCase() === "on") };
-  const attrs = Object.fromEntries((order.attributes || []).map(a => [a.name, a.value]));
-  if (attrs.__MW_THEME) return { theme: attrs.__MW_THEME, debug: attrs.__MW_DEBUG === "on" };
+
+  const rawAttrs = order?.note_attributes || order?.attributes || [];
+  const dict = Object.fromEntries(
+    (Array.isArray(rawAttrs) ? rawAttrs : [])
+      .map(a => [String(a.name || a.key || "").trim(), String(a.value ?? "").trim()])
+  );
+
+  if (dict.__MW_THEME) {
+    return { theme: dict.__MW_THEME, debug: (dict.__MW_DEBUG || "").toLowerCase() === "on" };
+  }
   return null;
 }
+
 function toNum(x){ const n = Number.parseFloat(String(x||"0")); return Number.isFinite(n)?n:0; }
 function fmtShipDate(d=new Date()){
   const t=new Date(d); const pad=n=>String(n).padStart(2,"0");
