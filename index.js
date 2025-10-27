@@ -397,6 +397,48 @@ app.post("/webhooks/orders-create", async (req,res)=>{
   }catch(e){ console.error(e); res.status(500).send("err"); }
 });
 
+app.post("/webhooks/orders-updated", async (req,res)=>{
+  try{
+    const raw=await getRawBody(req);
+    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
+    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
+    const order=JSON.parse(raw.toString("utf8"));
+    const mark=pickMark(order);
+    const topic=String(req.headers["x-shopify-topic"]||"");
+    const shop=String(req.headers["x-shopify-shop-domain"]||"");
+    const items=Array.isArray(order?.line_items)?order.line_items:[];
+    console.log(JSON.stringify({
+      t: Date.now(),
+      topic,
+      shop,
+      order_id: order?.id,
+      sub: isSubscription(order) ? 1 : 0,
+      hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
+      app_id: order?.app_id,
+      tags: order?.tags,
+      liProps: items.map(it => ({
+        id: it.id,
+        props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
+      }))
+    }));
+    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
+    if (!inPreview) {
+      console.log("skip-updated", order.id, order.name);
+      res.status(200).send("skip");
+      return;
+    }
+    const conv=await transformOrder(order);
+    remember({
+      id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
+      email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
+      payload:conv, created_at:order.created_at||new Date().toISOString()
+    });
+    statusById.set(order.id,"awaiting_shipment");
+    console.log("UPDATED MATCH",order.id,order.name,"items:",conv.after.length);
+    res.status(200).send("ok");
+  }catch(e){ console.error(e); res.status(500).send("err"); }
+});
+
 app.post("/webhooks/orders-cancelled", async (req,res)=>{
   try{
     const raw=await getRawBody(req);
@@ -458,7 +500,7 @@ function minimalXML(o){
         <Phone>${esc(bill.phone)}</Phone>
         <Email>${esc(email)}</Email>
         <Address1>${esc(bill.address1)}</Address1>
-        <Address2>${esc(bill.address2)}</Address2>}
+        <Address2>${esc(bill.address2)}</Address2>
         <City>${esc(bill.city)}</City>
         <State>${esc(bill.state)}</State>
         <PostalCode>${esc(bill.zip)}</PostalCode>
