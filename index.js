@@ -97,6 +97,11 @@ function anyAfterSellKey(li){
 
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
+  const json = JSON.stringify(order).toLowerCase();
+if (json.includes("aftersell")) {
+  return { children: order.line_items || [] };
+}
+
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
 
