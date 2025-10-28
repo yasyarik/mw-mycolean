@@ -311,7 +311,7 @@ function minimalXML(o) {
 <Orders>
   <Order>
     <OrderID>${esc(o.id)}</OrderID>
-    <OrderNumber>${esc(o.name)}</OrderNumber>
+    <OrderNumber>${esc(o.name.replace(/^#/, ''))}</OrderNumber>
     <OrderDate>${orderDate}</OrderDate>
     <OrderStatus>${shipStationStatus}</OrderStatus>
     <LastModified>${lastMod}</LastModified>
