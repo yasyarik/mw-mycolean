@@ -50,7 +50,6 @@ function skuSafe(i, orderId) {
   return `MW-${orderId}-${i.id || "ITEM"}`;
 }
 
-// === ДАТА: MM/DD/YYYY HH:MM ===
 function fmtShipDate(d = new Date()) {
   const t = new Date(d);
   const pad = n => String(n).padStart(2, "0");
@@ -107,12 +106,11 @@ function remember(e) {
   bestById.set(String(e.id), e);
 }
 
-// === ПОСЛЕДНИЙ ЗАКАЗ ===
 function getLastOrder() {
   return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
 }
 
-// === КАРТИНКА ПО VARIANT_ID (API + Fallback) ===
+// === КАРТИНКА ПО VARIANT_ID (API + Fallback + Логи) ===
 async function getVariantImage(variantId) {
   if (!variantId) {
     console.log("getVariantImage: NO variant_id");
@@ -188,37 +186,7 @@ async function getVariantImage(variantId) {
   }
 }
 
-  try {
-    const res = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, {
-      headers: { "X-Shopify-Access-Token": token }
-    });
-    if (!res.ok) throw new Error("Variant not found");
-
-    const data = await res.json();
-    const variant = data.variant;
-    let imageUrl = variant.image?.src || "";
-
-    // Fallback: первая картинка продукта
-    if (!imageUrl && variant.product_id) {
-      const prodRes = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`, {
-        headers: { "X-Shopify-Access-Token": token }
-      });
-      if (prodRes.ok) {
-        const p = await prodRes.json();
-        imageUrl = p.product.images?.[0]?.src || "";
-      }
-    }
-
-    variantImageCache.set(key, imageUrl);
-    return imageUrl;
-  } catch (e) {
-    console.error("Image fetch failed for variant:", variantId, e.message);
-    variantImageCache.set(key, "");
-    return "";
-  }
-}
-
-// === TRANSFORM ORDER (с API-картинками) ===
+// === TRANSFORM ORDER ===
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
@@ -234,7 +202,6 @@ async function transformOrder(order) {
     return { after };
   }
 
-  // Обычные товары
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
@@ -302,7 +269,7 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
   }
 });
 
-// === XML ДЛЯ SHIPSTATION ===
+// === XML ===
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) {
     return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
@@ -384,7 +351,7 @@ function minimalXML(o) {
 </Orders>`;
 }
 
-// === SHIPSTATION HANDLER ===
+// === SHIPSTATION ===
 function authOK(req) {
   const h = req.headers.authorization || "";
   if (h.startsWith("Basic ")) {
@@ -412,7 +379,7 @@ app.use("/shipstation", (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-// === HEALTH CHECK ===
+// === HEALTH ===
 app.get("/health", (req, res) => res.send("OK"));
 
 // === ЗАПУСК ===
