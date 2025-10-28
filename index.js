@@ -12,6 +12,23 @@ function hmacOk(raw, header, secret) {
   const a = Buffer.from(header), b = Buffer.from(sig);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+function pickMark(order) {
+  const note = String(order?.note || "");
+  const mT = note.match(/__MW_THEME\s*=\s*([^\s;]+)/i);
+  const mD = note.match(/__MW_DEBUG\s*=\s*([^\s;]+)/i);
+  if (mT) return { theme: mT[1], debug: !!(mD && mD[1].toLowerCase() === "on") };
+
+  const rawAttrs = order?.note_attributes || order?.attributes || [];
+  const dict = Object.fromEntries(
+    (Array.isArray(rawAttrs) ? rawAttrs : [])
+      .map(a => [String(a.name || a.key || "").trim(), String(a.value ?? "").trim()])
+  );
+
+  if (dict.__MW_THEME) {
+    return { theme: dict.__MW_THEME, debug: (dict.__MW_DEBUG || "").toLowerCase() === "on" };
+  }
+  return null;
+}
 
 function toNum(x){ const n = Number.parseFloat(String(x||"0")); return Number.isFinite(n)?n:0; }
 function fmtShipDate(d=new Date()){
@@ -115,53 +132,45 @@ function isSubscription(order) {
 function sbDetectFromOrder(order){
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   const tagStr = String(order.tags || "").toLowerCase();
-  const hasSB = tagStr.includes("simple bundles");
-  const hasAS = tagStr.includes("aftersell");
-  const daTitles = (Array.isArray(order.discount_applications) ? order.discount_applications : [])
-    .map(d => String(d.title || d.description || "").toLowerCase())
-    .join(" | ");
+  if (!items.length) return null;
   const epsilon = 0.00001;
   const daSum = li => (Array.isArray(li.discount_allocations) ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0) : 0);
   const zeroed = li => (daSum(li) >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
-
-  if (!items.length) return null;
-
   const children = items.filter(li => zeroed(li));
   const parents = items.filter(li => !zeroed(li));
-
   if (children.length && parents.length === 1) {
     return { parent: parents[0], children };
   }
-
-  const isASContext = hasAS || /aftersell|upsell/.test(daTitles);
-  const isSBContext = hasSB;
-
-  if ((isSBContext || isASContext) && items.length > 1) {
-    const withPrice = items.filter(li => toNum(li.price) > 0);
-    let parentGuess = null;
-    if (withPrice.length) {
-      const maxPrice = Math.max(...withPrice.map(li => toNum(li.price)));
-      parentGuess = withPrice.find(li => toNum(li.price) === maxPrice) || null;
-    }
-    if (parentGuess) {
-      const rest = items.filter(li => li !== parentGuess);
-      return { parent: parentGuess, children: rest };
-    }
+  if (children.length && tagStr.includes("simple bundles")) {
+    return { parent: null, children };
   }
-
   const withPrice = items.filter(li => toNum(li.price) > 0);
   const maxPrice = withPrice.length ? Math.max(...withPrice.map(li => toNum(li.price))) : 0;
   const parentGuess = withPrice.find(li => toNum(li.price) === maxPrice) || null;
-  if ((isSBContext || isASContext) && parentGuess && items.length > 1) {
+  if (tagStr.includes("simple bundles") && parentGuess && items.length > 1) {
     const rest = items.filter(li => li !== parentGuess);
     return { parent: parentGuess, children: rest };
   }
   return null;
 }
+function pushLine(after, li, { unitPrice = null, parent = false, key = null } = {}){
+  const price = unitPrice != null ? unitPrice : toNum(li.price);
+  after.push({
+    id: li.id,
+    title: li.title,
+    sku: li.sku || null,
+    qty: li.quantity || 1,
+    unitPrice: price,
+    parent,
+    key
+  });
+}
 
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
 const statusById=new Map();
 const variantPriceCache=new Map();
+
+// keep the best version per order_id (max children count)
 const bestById = new Map();
 function childrenCount(o){
   return Array.isArray(o?.payload?.after) ? o.payload.after.filter(i => !i.parent).length : 0;
@@ -229,18 +238,6 @@ async function fetchBundleRecipe(productId, variantId){
     if(vid && qty>0) out.push({ variantId: vid, qty });
   }
   return out.length ? out : null;
-}
-function pushLine(after, li, { unitPrice = null, parent = false, key = null } = {}){
-  const price = unitPrice != null ? unitPrice : toNum(li.price);
-  after.push({
-    id: li.id,
-    title: li.title,
-    sku: li.sku || null,
-    qty: li.quantity || 1,
-    unitPrice: price,
-    parent,
-    key
-  });
 }
 
 async function transformOrder(order){
@@ -378,6 +375,7 @@ app.post("/webhooks/orders-create", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
+    const mark=pickMark(order);
     const topic=String(req.headers["x-shopify-topic"]||"");
     const shop=String(req.headers["x-shopify-shop-domain"]||"");
     const items=Array.isArray(order?.line_items)?order.line_items:[];
@@ -395,6 +393,12 @@ app.post("/webhooks/orders-create", async (req,res)=>{
         props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
       }))
     }));
+    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
+    if (!inPreview) {
+      console.log("skip", order.id, order.name);
+      res.status(200).send("skip");
+      return;
+    }
     const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
@@ -413,6 +417,7 @@ app.post("/webhooks/orders-updated", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
+    const mark=pickMark(order);
     const topic=String(req.headers["x-shopify-topic"]||"");
     const shop=String(req.headers["x-shopify-shop-domain"]||"");
     const items=Array.isArray(order?.line_items)?order.line_items:[];
@@ -430,6 +435,12 @@ app.post("/webhooks/orders-updated", async (req,res)=>{
         props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
       }))
     }));
+    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
+    if (!inPreview) {
+      console.log("skip-updated", order.id, order.name);
+      res.status(200).send("skip");
+      return;
+    }
     const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
@@ -448,6 +459,8 @@ app.post("/webhooks/orders-cancelled", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
+    const mark=pickMark(order);
+    if(!(mark && String(mark.theme||"").startsWith("preview-"))){ console.log("cancel skip",order.id,order.name); res.status(200).send("skip"); return; }
     statusById.set(order.id,"cancelled");
     if(!last() || last().id!==order.id){
       remember({
