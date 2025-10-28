@@ -314,6 +314,14 @@ async function getVariantImage(variantId) {
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
+  const tags = String(order.tags || "").toLowerCase();
+  const anyBundle = sbDetectFromOrder(order);
+  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
+
+  if (!anyBundle && !hasBundleTag) {
+    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
+    return { after: [] };
+  }
 
   const sb = sbDetectFromOrder(order);
   if (sb) {
