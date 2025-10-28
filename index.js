@@ -250,6 +250,18 @@ async function fetchBundleRecipe(productId, variantId){
   }
   return out.length ? out : null;
 }
+function pushLine(after, li, { unitPrice = null, parent = false, key = null } = {}){
+  const price = unitPrice != null ? unitPrice : toNum(li.price);
+  after.push({
+    id: li.id,
+    title: li.title,
+    sku: li.sku || null,
+    qty: li.quantity || 1,
+    unitPrice: price,
+    parent,
+    key
+  });
+}
 
 async function transformOrder(order){
   const groups={};
