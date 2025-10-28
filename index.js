@@ -1,4 +1,3 @@
-
 import express from "express";
 import dotenv from "dotenv";
 import getRawBody from "raw-body";
@@ -7,7 +6,6 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
-// === УТИЛИТЫ ===
 function hmacOk(raw, header, secret) {
   if (!header || !secret) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -62,11 +60,47 @@ function fmtShipDate(d = new Date()) {
   return `${month}/${day}/${year} ${hours}:${minutes}`;
 }
 
+function hasParentFlag(li){
+  const p = Array.isArray(li?.properties) ? li.properties : [];
+  const get = n => p.find(x => x.name === n)?.value;
+  if (String(get("_sb_parent")).toLowerCase() === "true") return true;
+  if (String(get("skio_parent")).toLowerCase() === "true") return true;
+  if (get("_bundle") || get("bundle_id")) return true;
+  return false;
+}
+
+function bundleKey(li){
+  const p = Array.isArray(li?.properties) ? li.properties : [];
+  const val = (n) => p.find(x => x.name === n)?.value;
+  let v =
+    val("_sb_bundle_id") ||
+    val("bundle_id") ||
+    val("_bundle_id") ||
+    val("skio_bundle_id") ||
+    val("_sb_key") ||
+    val("bundle_key") ||
+    val("skio_bundle_key");
+  if (!v) {
+    const g = val("_sb_bundle_group");
+    if (g) v = String(g).split(" ")[0];
+  }
+  return v ? String(v) : null;
+}
+
+function anyAfterSellKey(li){
+  const p = Array.isArray(li?.properties) ? li.properties : [];
+  return p.some(x => {
+    const n = String(x.name||"").toLowerCase();
+    return n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
+  });
+}
+
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
 
+  const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
     const da = Array.isArray(li.discount_allocations)
@@ -75,12 +109,45 @@ function sbDetectFromOrder(order) {
     return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
   };
 
-  const children = items.filter(zeroed);
-  const parents = items.filter(li => !zeroed(li));
-
-  if (children.length && parents.length === 1) {
-    return { children };
+  const zeroChildren = items.filter(zeroed);
+  const nonZero = items.filter(li => !zeroed(li));
+  if (zeroChildren.length && nonZero.length >= 1) {
+    return { children: zeroChildren };
   }
+  if (zeroChildren.length && tagStr.includes("simple bundles")) {
+    return { children: zeroChildren };
+  }
+
+  const groups = new Map();
+  for (const li of items) {
+    const k = bundleKey(li);
+    if (!k && !hasParentFlag(li) && !anyAfterSellKey(li)) continue;
+    const key = k || `__flag__${li.id}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(li);
+  }
+
+  const children = new Set();
+
+  for (const arr of groups.values()) {
+    if (arr.length < 2) continue;
+
+    const zeros = arr.filter(zeroed);
+    if (zeros.length) {
+      zeros.forEach(li => children.add(li));
+      continue;
+    }
+
+    if (arr.some(hasParentFlag)) {
+      arr.forEach(li => { if (!hasParentFlag(li)) children.add(li); });
+      continue;
+    }
+  }
+
+  if (children.size > 0) {
+    return { children: Array.from(children) };
+  }
+
   return null;
 }
 
@@ -95,7 +162,6 @@ function pushLine(after, li, imageUrl = "") {
   });
 }
 
-// === КЭШИ ===
 const history = [];
 const bestById = new Map();
 const statusById = new Map();
@@ -111,7 +177,6 @@ function getLastOrder() {
   return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
 }
 
-// === КАРТИНКА ПО VARIANT_ID (API + Fallback + Логи) ===
 async function getVariantImage(variantId) {
   if (!variantId) {
     console.log("getVariantImage: NO variant_id");
@@ -187,7 +252,6 @@ async function getVariantImage(variantId) {
   }
 }
 
-// === TRANSFORM ORDER ===
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
@@ -219,7 +283,6 @@ async function transformOrder(order) {
   return { after };
 }
 
-// === ОБЩИЙ ОБРАБОТЧИК ===
 async function handleOrderCreateOrUpdate(req, res) {
   try {
     const raw = await getRawBody(req);
@@ -248,7 +311,6 @@ async function handleOrderCreateOrUpdate(req, res) {
   }
 }
 
-// === ВЕБХУКИ ===
 app.post("/webhooks/orders-create", handleOrderCreateOrUpdate);
 app.post("/webhooks/orders-updated", handleOrderCreateOrUpdate);
 
@@ -270,7 +332,6 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
   }
 });
 
-// === XML ===
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) {
     return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
@@ -287,14 +348,10 @@ function minimalXML(o) {
 
   const total = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const bill = filledAddress(o.billing_address || {});
-  const ship = filledAddress(o.shipping_address || o.billing_address || {}); // fallback на billing
-
+  const ship = filledAddress(o.shipping_address || o.billing_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
-
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
   const lastMod = fmtShipDate(new Date());
-
-  // ВОЗВРАЩАЕМ ТОТ СТАТУС, КОТОРЫЙ РАБОТАЛ РАНЬШЕ
   const shipStationStatus = "awaiting_shipment";
 
   const itemsXml = items.map(i => `
@@ -353,7 +410,6 @@ function minimalXML(o) {
 </Orders>`;
 }
 
-// === SHIPSTATION ===
 function authOK(req) {
   const h = req.headers.authorization || "";
   if (h.startsWith("Basic ")) {
@@ -381,10 +437,8 @@ app.use("/shipstation", (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-// === HEALTH ===
 app.get("/health", (req, res) => res.send("OK"));
 
-// === ЗАПУСК ===
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
