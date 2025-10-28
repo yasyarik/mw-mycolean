@@ -286,14 +286,15 @@ function minimalXML(o) {
 
   const total = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const bill = filledAddress(o.billing_address || {});
-  const ship = filledAddress(o.shipping_address || {});
+  const ship = filledAddress(o.shipping_address || o.billing_address || {}); // fallback на billing
+
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
 
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
   const lastMod = fmtShipDate(new Date());
 
-  const status = statusById.get(o.id) || "awaiting_shipment";
-  const shipStationStatus = status === "awaiting_shipment" ? "awaiting_fulfillment" : status;
+  // ВОЗВРАЩАЕМ ТОТ СТАТУС, КОТОРЫЙ РАБОТАЛ РАНЬШЕ
+  const shipStationStatus = "awaiting_shipment";
 
   const itemsXml = items.map(i => `
     <Item>
