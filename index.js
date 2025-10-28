@@ -166,15 +166,45 @@ function remember(e){
 async function fetchVariantDetails(variantId){
   const key=String(variantId);
   if(variantDetailsCache.has(key)) return variantDetailsCache.get(key);
+
   const shop=process.env.SHOPIFY_SHOP;
   const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
   if(!shop||!token) return {price: 0, imageUrl: ""};
-  const url=`https://${shop}/admin/api/2025-01/variants/${key}.json`;
+
+  const url=`https://${shop}/admin/api/2025-01/variants/${key}.json?fields=id,price,image_id,product_id`;
   const r=await fetch(url,{headers:{"X-Shopify-Access-Token":token,"Content-Type":"application/json"}});
   if(!r.ok) return {price: 0, imageUrl: ""};
+
   const j=await r.json();
-  const price=toNum(j?.variant?.price);
-  const imageUrl = j?.variant?.image?.src || j?.variant?.featured_image?.src || "";
+  const variant = j.variant;
+  const price = toNum(variant.price);
+  let imageUrl = "";
+
+  // 1. Если есть image_id — делаем отдельный запрос
+  if (variant.image_id) {
+    const imgUrl = `https://${shop}/admin/api/2025-01/images/${variant.image_id}.json`;
+    try {
+      const imgRes = await fetch(imgUrl, {headers: {"X-Shopify-Access-Token": token}});
+      if (imgRes.ok) {
+        const imgJson = await imgRes.json();
+        imageUrl = imgJson.image?.src || "";
+      }
+    } catch (_) {}
+  }
+
+  // 2. Если нет — берём первое изображение продукта
+  if (!imageUrl && variant.product_id) {
+    const prodUrl = `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`;
+    try {
+      const prodRes = await fetch(prodUrl, {headers: {"X-Shopify-Access-Token": token}});
+      if (prodRes.ok) {
+        const prodJson = await prodRes.json();
+        const firstImg = prodJson.product?.images?.[0];
+        if (firstImg?.src) imageUrl = firstImg.src;
+      }
+    } catch (_) {}
+  }
+
   const details = {price, imageUrl};
   variantDetailsCache.set(key, details);
   return details;
