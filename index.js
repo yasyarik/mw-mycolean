@@ -38,6 +38,20 @@ function skuSafe(i, orderId){
   return `MW-${orderId}-${base}`;
 }
 
+// === ПОИСК variant_id В СВОЙСТВАХ ===
+function getVariantIdFromProperties(li) {
+  const props = li.properties || [];
+  const keys = ["_sb_variant_id", "variant_id", "_bundle_variant_id", "component_variant_id"];
+  for (const key of keys) {
+    const prop = props.find(p => p.name === key);
+    if (prop && prop.value) {
+      const match = String(prop.value).match(/(\d+)$/);
+      if (match) return match[1];
+    }
+  }
+  return null;
+}
+
 // === SB ЛОГИКА ===
 function sbDetectFromOrder(order){
   const items = Array.isArray(order.line_items) ? order.line_items : [];
@@ -89,7 +103,7 @@ function remember(e){
   }
 }
 
-// === GRAPHQL + FALLBACK ДЛЯ КАРТИНОК ===
+// === GRAPHQL + REST + FALLBACK ДЛЯ КАРТИНОК ===
 async function fetchVariantDetails(variantId){
   const key = String(variantId);
   if(variantDetailsCache.has(key)) return variantDetailsCache.get(key);
@@ -101,7 +115,7 @@ async function fetchVariantDetails(variantId){
   let imageUrl = "";
   let price = 0;
 
-  // 1. GraphQL — с transformedSrc и src
+  // 1. GraphQL
   const gql = `
     query($id: ID!) {
       productVariant(id: $id) {
@@ -143,7 +157,6 @@ async function fetchVariantDetails(variantId){
       const v = j.data?.productVariant;
       price = toNum(v?.price);
 
-      // Попробуем все возможные поля
       const img = v?.image;
       imageUrl = img?.url || img?.src || img?.transformedSrc;
 
@@ -156,7 +169,7 @@ async function fetchVariantDetails(variantId){
     console.error("GraphQL error:", e);
   }
 
-  // 2. REST fallback (на всякий случай)
+  // 2. REST fallback
   if (!imageUrl) {
     try {
       const restUrl = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
@@ -178,15 +191,9 @@ async function fetchVariantDetails(variantId){
     } catch (_) {}
   }
 
-  // 3. Финальный fallback: CDN URL по variant_id (если есть)
-  if (!imageUrl && variantId) {
-    imageUrl = `https://cdn.shopify.com/s/files/1/0000/0000/${variantId}_500x500.jpg`;
-  }
-
   const details = {price, imageUrl};
   variantDetailsCache.set(key, details);
 
-  // ЛОГ ДЛЯ ОТЛАДКИ
   console.log("FETCHED VARIANT", { variantId, price, imageUrl: imageUrl ? "OK" : "MISSING" });
 
   return details;
@@ -197,26 +204,35 @@ async function transformOrder(order){
   const after = [];
   const handled = new Set();
 
-  // 1. SB DETECT — ГЛАВНОЕ
   const sb = sbDetectFromOrder(order);
   if (sb) {
     const { children } = sb;
-    const key = "_sb_auto";
 
     for (const c of children) {
       handled.add(c.id);
-      const vid = c.variant_id || c.variantId || null;
-      const details = vid ? await fetchVariantDetails(vid) : {price:0, imageUrl:""};
-      pushLine(after, c, { key, imageUrl: details.imageUrl });
 
-      console.log("SB ITEM", { id: c.id, title: c.title, price: details.price, imageUrl: details.imageUrl });
+      let vid = c.variant_id || c.variantId || null;
+      if (!vid) {
+        vid = getVariantIdFromProperties(c);
+      }
+
+      const details = vid ? await fetchVariantDetails(vid) : {price: 0, imageUrl: ""};
+
+      pushLine(after, c, { imageUrl: details.imageUrl });
+
+      console.log("SB CHILD", { 
+        lineItemId: c.id, 
+        title: c.title, 
+        variantId: vid, 
+        imageUrl: details.imageUrl ? "OK" : "MISSING" 
+      });
     }
 
-    console.log("SB-DETECT", { children: children.map(c=>c.id), count: after.length });
-    return { after }; // ВЫХОД — НЕ ДАЁМ ДРУГИМ БЛОКАМ РАБОТАТЬ
+    console.log("SB-DETECT", { count: after.length });
+    return { after };
   }
 
-  // 2. Обычные товары (не бандлы)
+  // Обычные товары
   for(const li of (order.line_items||[])){
     if(handled.has(li.id)) continue;
     const vid = li.variant_id || null;
@@ -285,7 +301,7 @@ app.post("/webhooks/orders-cancelled", async (req,res)=>{
   }catch(e){ console.error(e); res.status(500).send("err"); }
 });
 
-// === ЧИСТЫЙ XML ДЛЯ SHIPSTATION ===
+// === XML ДЛЯ SHIPSTATION ===
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
 
