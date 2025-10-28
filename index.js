@@ -176,6 +176,65 @@ function remember(e) {
 function getLastOrder() {
   return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
 }
+let SS_LAST_REFRESH_AT = 0;
+let SS_REFRESH_TIMER = null;
+
+function isMWOrder(order, conv){
+  try {
+    const items = Array.isArray(order?.line_items) ? order.line_items : [];
+    const origCount = items.length;
+    if (conv && Array.isArray(conv.after) && conv.after.length !== origCount) return true;
+
+    const tags = String(order?.tags || "").toLowerCase();
+    if (tags.includes("simple bundles")) return true;
+
+    const epsilon = 0.00001;
+    const zeroed = (li) => {
+      const da = Array.isArray(li.discount_allocations)
+        ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0)
+        : 0;
+      return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
+    };
+
+    for (const li of items) {
+      if (li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id) return true;
+
+      const props = Array.isArray(li.properties) ? li.properties : [];
+      if (props.some(p => {
+        const n = String(p?.name || "").toLowerCase();
+        return n.includes("_sb_") || n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
+      })) return true;
+
+      if (zeroed(li)) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+async function ssRefreshNow(){
+  const id = process.env.SS_STORE_ID;
+  const key = process.env.SS_KEY;
+  const sec = process.env.SS_SECRET;
+  if (!id || !key || !sec) return;
+  const auth = Buffer.from(`${key}:${sec}`).toString("base64");
+  try {
+    await fetch(`https://ssapi.shipstation.com/stores/refreshstore?storeId=${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { Authorization: `Basic ${auth}` }
+    });
+  } catch (_) {}
+}
+
+function scheduleSSRefresh(){
+  const now = Date.now();
+  if (now - SS_LAST_REFRESH_AT < 20000) return;
+  if (SS_REFRESH_TIMER) clearTimeout(SS_REFRESH_TIMER);
+  SS_REFRESH_TIMER = setTimeout(async () => {
+    SS_REFRESH_TIMER = null;
+    await ssRefreshNow();
+    SS_LAST_REFRESH_AT = Date.now();
+  }, 5000);
+}
 
 async function getVariantImage(variantId) {
   if (!variantId) {
