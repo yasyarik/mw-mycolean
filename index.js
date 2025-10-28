@@ -8,31 +8,49 @@ const app = express();
 
 // === УТИЛИТЫ ===
 function hmacOk(raw, header, secret) {
-  if (!header) return false;
+  if (!header || !secret) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
   const a = Buffer.from(header), b = Buffer.from(sig);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function toNum(x){ return Number.isFinite(x)?x:0; }
-function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function money2(v){ return (Number.isFinite(v)?v:0).toFixed(2); }
-function filledAddress(a){
-  const d=v=>(v&&String(v).trim())?String(v):"";
-  const name=[d(a.first_name),d(a.last_name)].filter(Boolean).join(" ")||"Customer";
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function esc(x = "") {
+  return String(x).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function money2(v) {
+  return (Number.isFinite(v) ? v : 0).toFixed(2);
+}
+
+function filledAddress(a) {
+  const d = v => (v && String(v).trim()) ? String(v) : "";
+  const name = [d(a.first_name), d(a.last_name)].filter(Boolean).join(" ") || "Customer";
   return {
-    name, company:d(a.company)||"", phone:d(a.phone)||"", email:d(a.email)||"",
-    address1:d(a.address1)||"Address line 1", address2:d(a.address2)||"",
-    city:d(a.city)||"City", state:(d(a.province_code)||"ST").slice(0,2).toUpperCase(),
-    zip:d(a.zip)||"00000", country:(d(a.country_code)||"US").slice(0,2).toUpperCase()
+    name,
+    company: d(a.company) || "",
+    phone: d(a.phone) || "",
+    email: d(a.email) || "",
+    address1: d(a.address1) || "Address line 1",
+    address2: d(a.address2) || "",
+    city: d(a.city) || "City",
+    state: (d(a.province_code) || "ST").slice(0, 2).toUpperCase(),
+    zip: d(a.zip) || "00000",
+    country: (d(a.country_code) || "US").slice(0, 2).toUpperCase()
   };
 }
-function skuSafe(i, orderId){
-  const s=(i.sku||"").trim(); if(s) return s;
+
+function skuSafe(i, orderId) {
+  const s = (i.sku || "").trim();
+  if (s) return s;
   return `MW-${orderId}-${i.id || "ITEM"}`;
 }
 
-// === ДАТА ДЛЯ SHIPSTATION: MM/DD/YYYY HH:MM ===
+// === ДАТА: MM/DD/YYYY HH:MM ===
 function fmtShipDate(d = new Date()) {
   const t = new Date(d);
   const pad = n => String(n).padStart(2, "0");
@@ -44,20 +62,25 @@ function fmtShipDate(d = new Date()) {
   return `${month}/${day}/${year} ${hours}:${minutes}`;
 }
 
-// === SB DETECT ===
-function sbDetectFromOrder(order){
+// === SIMPLE BUNDLES DETECT ===
+function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
 
   const epsilon = 0.00001;
   const zeroed = li => {
-    const da = (Array.isArray(li.discount_allocations) ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0) : 0);
+    const da = Array.isArray(li.discount_allocations)
+      ? li.discount_allocations.reduce((s, d) => s + toNum(d.amount), 0)
+      : 0;
     return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
   };
+
   const children = items.filter(zeroed);
   const parents = items.filter(li => !zeroed(li));
 
-  if (children.length && parents.length === 1) return { children };
+  if (children.length && parents.length === 1) {
+    return { children };
+  }
   return null;
 }
 
@@ -77,14 +100,14 @@ const history = [];
 const bestById = new Map();
 const statusById = new Map();
 
-function remember(e){
+function remember(e) {
   history.push(e);
-  while(history.length>100) history.shift();
+  while (history.length > 100) history.shift();
   bestById.set(String(e.id), e);
 }
 
 // === TRANSFORM ORDER (БЕЗ API) ===
-async function transformOrder(order){
+async function transformOrder(order) {
   const after = [];
   const handled = new Set();
 
@@ -103,8 +126,9 @@ async function transformOrder(order){
     return { after };
   }
 
-  for(const li of (order.line_items||[])){
-    if(handled.has(li.id)) continue;
+  // Обычные товары
+  for (const li of (order.line_items || [])) {
+    if (handled.has(li.id)) continue;
     let imageUrl = "";
     if (li.product_id) {
       const pid = String(li.product_id).padStart(10, '0');
@@ -123,47 +147,73 @@ async function transformOrder(order){
   return { after };
 }
 
-// === ВЕБХУКИ ===
-app.post("/webhooks/orders-create", async (req,res)=>{
-  try{
-    const raw=await getRawBody(req);
-    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
-    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad"); return; }
-    const order=JSON.parse(raw.toString("utf8"));
-    const conv=await transformOrder(order);
+// === ОБЩИЙ ОБРАБОТЧИК ДЛЯ CREATE И UPDATED ===
+async function handleOrderCreateOrUpdate(req, res) {
+  try {
+    const raw = await getRawBody(req);
+    const hdr = req.headers["x-shopify-hmac-sha256"] || "";
+    if (!hmacOk(raw, hdr, process.env.SHOPIFY_WEBHOOK_SECRET || "")) {
+      res.status(401).send("bad hmac");
+      return;
+    }
+    const order = JSON.parse(raw.toString("utf8"));
+    const conv = await transformOrder(order);
     remember({
-      id:order.id, name:order.name, email:order.email||"", 
-      shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
-      payload:conv, created_at:order.created_at||new Date().toISOString()
+      id: order.id,
+      name: order.name,
+      email: order.email || "",
+      shipping_address: order.shipping_address || {},
+      billing_address: order.billing_address || {},
+      payload: conv,
+      created_at: order.created_at || new Date().toISOString()
     });
-    statusById.set(order.id,"awaiting_shipment");
-    console.log("ORDER", order.id, "items:", conv.after.length);
+    statusById.set(order.id, "awaiting_shipment");
+    console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
     res.status(200).send("ok");
-  }catch(e){ console.error(e); res.status(500).send("err"); }
-});
+  } catch (e) {
+    console.error("Webhook error:", e);
+    res.status(500).send("error");
+  }
+}
 
-app.post("/webhooks/orders-updated", app.post("/webhooks/orders-create"));
+// === ВЕБХУКИ ===
+app.post("/webhooks/orders-create", handleOrderCreateOrUpdate);
+app.post("/webhooks/orders-updated", handleOrderCreateOrUpdate);
 
-app.post("/webhooks/orders-cancelled", async (req,res)=>{
-  try{
-    const raw=await getRawBody(req);
-    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
-    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad"); return; }
-    const order=JSON.parse(raw.toString("utf8"));
-    statusById.set(order.id,"cancelled");
+app.post("/webhooks/orders-cancelled", async (req, res) => {
+  try {
+    const raw = await getRawBody(req);
+    const hdr = req.headers["x-shopify-hmac-sha256"] || "";
+    if (!hmacOk(raw, hdr, process.env.SHOPIFY_WEBHOOK_SECRET || "")) {
+      res.status(401).send("bad hmac");
+      return;
+    }
+    const order = JSON.parse(raw.toString("utf8"));
+    statusById.set(order.id, "cancelled");
+    console.log("ORDER CANCELLED", order.id);
     res.status(200).send("ok");
-  }catch(e){ console.error(e); res.status(500).send("err"); }
+  } catch (e) {
+    console.error("Cancel webhook error:", e);
+    res.status(500).send("error");
+  }
 });
 
 // === XML ДЛЯ SHIPSTATION ===
 function minimalXML(o) {
-  if (!o || !o.payload?.after?.length) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
+  if (!o || !o.payload?.after?.length) {
+    return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
+  }
 
   const items = o.payload.after.map(i => ({
-    id: i.id, title: i.title, sku: i.sku || "", qty: i.qty, unitPrice: i.unitPrice, imageUrl: i.imageUrl || ""
+    id: i.id,
+    title: i.title,
+    sku: i.sku || "",
+    qty: i.qty,
+    unitPrice: i.unitPrice,
+    imageUrl: i.imageUrl || ""
   }));
 
-  const total = items.reduce((s,i)=>s+i.unitPrice*i.qty,0);
+  const total = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const bill = filledAddress(o.billing_address || {});
   const ship = filledAddress(o.shipping_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
@@ -228,26 +278,33 @@ function minimalXML(o) {
 }
 
 // === SHIPSTATION HANDLER ===
-function authOK(req){
-  const h=req.headers.authorization||"";
-  if(h.startsWith("Basic ")){
-    const [u,p]=Buffer.from(h.slice(6),"base64").toString("utf8").split(":",2);
-    if(u===process.env.SS_USER && p===process.env.SS_PASS) return true;
+function authOK(req) {
+  const h = req.headers.authorization || "";
+  if (h.startsWith("Basic ")) {
+    const [u, p] = Buffer.from(h.slice(6), "base64").toString("utf8").split(":", 2);
+    return u === process.env.SS_USER && p === process.env.SS_PASS;
   }
   return false;
 }
 
-app.use("/shipstation", (req,res)=>{
-  res.set("Content-Type","application/xml; charset=utf-8");
-  if(!process.env.SS_USER || !process.env.SS_PASS || !authOK(req)){
-    res.status(401).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth failed</Error>`);
+app.use("/shipstation", (req, res) => {
+  res.set("Content-Type", "application/xml; charset=utf-8");
+
+  if (!process.env.SS_USER || !process.env.SS_PASS || !authOK(req)) {
+    res.status(401).send(`<?xml version="1.0" encoding="utf-8"?><Error>Authentication failed</Error>`);
     return;
   }
 
   const id = req.query.order_id;
-  const order = id ? bestById.get(String(id)) : history[history.length-1];
-  res.send(minimalXML(order || {payload:{after:[]}}));
+  const order = id ? bestById.get(String(id)) : history[history.length - 1];
+  res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-app.get("/health", (req,res)=>res.send("ok"));
-app.listen(process.env.PORT||8080, () => console.log("Server running on port", process.env.PORT||8080));
+// === HEALTH CHECK ===
+app.get("/health", (req, res) => res.send("OK"));
+
+// === ЗАПУСК ===
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
