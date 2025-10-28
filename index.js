@@ -167,23 +167,9 @@ function pushLine(after, li, { unitPrice = null, parent = false, key = null } = 
 }
 
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
+function remember(e){ history.push(e); while(history.length>100) history.shift(); }
 const statusById=new Map();
 const variantPriceCache=new Map();
-
-// keep the best version per order_id (max children count)
-const bestById = new Map();
-function childrenCount(o){
-  return Array.isArray(o?.payload?.after) ? o.payload.after.filter(i => !i.parent).length : 0;
-}
-function remember(e){
-  history.push(e);
-  while(history.length>100) history.shift();
-  const key = String(e.id);
-  const prev = bestById.get(key);
-  if (!prev || childrenCount(e) >= childrenCount(prev)) {
-    bestById.set(key, e);
-  }
-}
 
 async function fetchVariantPrice(variantId){
   const key=String(variantId);
@@ -568,8 +554,7 @@ function shipstationHandler(req,res){
   if(action==="test"||action==="status"){ res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`); return; }
   if (q.order_id) {
     const wanted = String(q.order_id);
-    const best = bestById.get(wanted);
-    const found = best || history.slice().reverse().find(o => String(o.id) === wanted);
+    const found = history.slice().reverse().find(o => String(o.id) === wanted);
     const xml = minimalXML(found || null);
     res.status(200).send(xml);
     return;
