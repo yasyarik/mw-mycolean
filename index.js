@@ -408,7 +408,7 @@ async function handleOrderCreateOrUpdate(req, res) {
 }
 
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
-    await refreshStoreNow();
+
 
     res.status(200).send("ok");
   } catch (e) {
@@ -546,23 +546,7 @@ app.use("/shipstation", (req, res) => {
 app.get("/health", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 8080;
-async function refreshStoreNow() {
-  const storeId = process.env.SS_STORE_ID;
-  const key = process.env.SS_V2_KEY;
-  const secret = process.env.SS_V2_SECRET || "";
-  if (!storeId || !key) {
-    console.log("Missing ShipStation API credentials");
-    return;
-  }
 
-  const auth = Buffer.from(`${key}:${secret}`).toString("base64");
-  const res = await fetch(
-    `https://ssapi.shipstation.com/stores/refreshstore?storeId=${storeId}`,
-    {
-      method: "POST",
-      headers: { Authorization: `Basic ${auth}` },
-    }
-  );
 
   console.log("ShipStation refreshstore →", res.status, await res.text());
 }
