@@ -89,7 +89,7 @@ function remember(e){
   }
 }
 
-// === GRAPHQL ДЛЯ КАРТИНОК ===
+// === GRAPHQL + FALLBACK ДЛЯ КАРТИНОК ===
 async function fetchVariantDetails(variantId){
   const key = String(variantId);
   if(variantDetailsCache.has(key)) return variantDetailsCache.get(key);
@@ -98,28 +98,63 @@ async function fetchVariantDetails(variantId){
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
   if(!shop||!token) return {price: 0, imageUrl: ""};
 
+  let imageUrl = "";
+  let price = 0;
+
+  // 1. GraphQL
   const gql = `
     query($id: ID!) {
       productVariant(id: $id) {
         price
-        image { url }
-        product { images(first: 1) { edges { node { url } } } }
+        image {
+          url
+          transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
+        }
+        product {
+          images(first: 1) {
+            edges {
+              node {
+                url
+                transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
+              }
+            }
+          }
+        }
       }
     }
   `;
 
-  const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
-    method: "POST",
-    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
-    body: JSON.stringify({ query: gql, variables: { id: `gid://shopify/ProductVariant/${variantId}` } })
-  });
+  try {
+    const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+      method: "POST",
+      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: gql, variables: { id: `gid://shopify/ProductVariant/${variantId}` } })
+    });
 
-  if (!r.ok) return {price: 0, imageUrl: ""};
-  const j = await r.json();
-  const v = j.data?.productVariant;
+    if (r.ok) {
+      const j = await r.json();
+      const v = j.data?.productVariant;
+      price = toNum(v?.price);
 
-  const price = toNum(v?.price);
-  const imageUrl = v?.image?.url || v?.product?.images?.edges?.[0]?.node?.url || "";
+      imageUrl = v?.image?.url || v?.image?.transformedSrc;
+      if (!imageUrl) {
+        const firstImg = v?.product?.images?.edges?.[0]?.node;
+        imageUrl = firstImg?.url || firstImg?.transformedSrc;
+      }
+    }
+  } catch (_) {}
+
+  // 2. REST fallback
+  if (!imageUrl) {
+    try {
+      const restUrl = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
+      const restRes = await fetch(restUrl, {headers: {"X-Shopify-Access-Token": token}});
+      if (restRes.ok) {
+        const restJson = await restRes.json();
+        imageUrl = restJson.variant?.image?.src || "";
+      }
+    } catch (_) {}
+  }
 
   const details = {price, imageUrl};
   variantDetailsCache.set(key, details);
@@ -134,7 +169,7 @@ async function transformOrder(order){
   // 1. SB DETECT — ГЛАВНОЕ
   const sb = sbDetectFromOrder(order);
   if (sb) {
-    const { parent, children } = sb;
+    const { children } = sb;
     const key = "_sb_auto";
 
     for (const c of children) {
@@ -142,9 +177,11 @@ async function transformOrder(order){
       const vid = c.variant_id || c.variantId || null;
       const details = vid ? await fetchVariantDetails(vid) : {price:0, imageUrl:""};
       pushLine(after, c, { key, imageUrl: details.imageUrl });
+
+      console.log("SB ITEM", { id: c.id, title: c.title, price: details.price, imageUrl: details.imageUrl });
     }
 
-    console.log("SB-DETECT", { parent: parent?.id || null, children: children.map(c=>c.id), count: after.length });
+    console.log("SB-DETECT", { children: children.map(c=>c.id), count: after.length });
     return { after }; // ВЫХОД — НЕ ДАЁМ ДРУГИМ БЛОКАМ РАБОТАТЬ
   }
 
