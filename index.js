@@ -27,6 +27,16 @@ function pickMark(order) {
   if (dict.__MW_THEME) {
     return { theme: dict.__MW_THEME, debug: (dict.__MW_DEBUG || "").toLowerCase() === "on" };
   }
+  if (!dict.__MW_THEME && Array.isArray(order?.line_items)) {
+  for (const li of order.line_items) {
+    const props = Array.isArray(li.properties) ? li.properties : [];
+    const map = Object.fromEntries(props.map(p => [String(p.name||p.key||''), String(p.value||'')]));
+    if (map.__MW_THEME) {
+      return { theme: map.__MW_THEME, debug: (map.__MW_DEBUG||'').toLowerCase() === 'on' };
+    }
+  }
+}
+
   return null;
 }
 
