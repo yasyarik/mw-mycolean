@@ -97,14 +97,45 @@ function anyAfterSellKey(li){
 
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
-  const json = JSON.stringify(order).toLowerCase();
-if (json.includes("aftersell") || json.includes("upcart")) {
-  return { children: order.line_items || [] };
-}
-
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
 
+  const json = JSON.stringify(order).toLowerCase();
+
+  // --- AfterSell / UpCart detection ---
+  for (const li of items) {
+    const props = Array.isArray(li.properties) ? li.properties : [];
+    if (!props.length) continue;
+
+    const prop = props.find(p => {
+      const n = String(p.name || "").toLowerCase();
+      return n.includes("aftersell") || n.includes("upcart");
+    });
+    if (!prop) continue;
+
+    try {
+      const raw = prop.value;
+      if (typeof raw !== "string" || !raw.includes("{")) continue;
+
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) {
+        const children = parsed.map(c => ({
+          id: c.variant_id || c.id || Math.random(),
+          title: c.title || "",
+          sku: c.sku || "",
+          quantity: c.qty || c.quantity || 1,
+          price: toNum(c.price || 0),
+          variant_id: c.variant_id || c.id || null
+        }));
+        console.log(`AfterSell/UpCart bundle detected: ${children.length} children`);
+        return { children };
+      }
+    } catch (e) {
+      console.log("AfterSell/UpCart parse error:", e.message);
+    }
+  }
+
+  // --- Simple Bundles / Skio detection ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -133,16 +164,13 @@ if (json.includes("aftersell") || json.includes("upcart")) {
   }
 
   const children = new Set();
-
   for (const arr of groups.values()) {
     if (arr.length < 2) continue;
-
     const zeros = arr.filter(zeroed);
     if (zeros.length) {
       zeros.forEach(li => children.add(li));
       continue;
     }
-
     if (arr.some(hasParentFlag)) {
       arr.forEach(li => { if (!hasParentFlag(li)) children.add(li); });
       continue;
