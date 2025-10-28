@@ -98,7 +98,7 @@ function anyAfterSellKey(li){
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
   const json = JSON.stringify(order).toLowerCase();
-if (json.includes("aftersell")) {
+if (json.includes("aftersell") || json.includes("upcart")) {
   return { children: order.line_items || [] };
 }
 
