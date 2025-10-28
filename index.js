@@ -32,6 +32,18 @@ function skuSafe(i, orderId){
   return `MW-${orderId}-${i.id || "ITEM"}`;
 }
 
+// === ДАТА ДЛЯ SHIPSTATION: MM/DD/YYYY HH:MM ===
+function fmtShipDate(d = new Date()) {
+  const t = new Date(d);
+  const pad = n => String(n).padStart(2, "0");
+  const month = pad(t.getUTCMonth() + 1);
+  const day = pad(t.getUTCDate());
+  const year = t.getUTCFullYear();
+  const hours = pad(t.getUTCHours());
+  const minutes = pad(t.getUTCMinutes());
+  return `${month}/${day}/${year} ${hours}:${minutes}`;
+}
+
 // === SB DETECT ===
 function sbDetectFromOrder(order){
   const items = Array.isArray(order.line_items) ? order.line_items : [];
@@ -131,6 +143,7 @@ app.post("/webhooks/orders-create", async (req,res)=>{
 });
 
 app.post("/webhooks/orders-updated", app.post("/webhooks/orders-create"));
+
 app.post("/webhooks/orders-cancelled", async (req,res)=>{
   try{
     const raw=await getRawBody(req);
@@ -139,10 +152,10 @@ app.post("/webhooks/orders-cancelled", async (req,res)=>{
     const order=JSON.parse(raw.toString("utf8"));
     statusById.set(order.id,"cancelled");
     res.status(200).send("ok");
-  }catch(e){ res.status(500).send("err"); }
+  }catch(e){ console.error(e); res.status(500).send("err"); }
 });
 
-// === XML ===
+// === XML ДЛЯ SHIPSTATION ===
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
 
@@ -154,6 +167,9 @@ function minimalXML(o) {
   const bill = filledAddress(o.billing_address || {});
   const ship = filledAddress(o.shipping_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
+
+  const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
+  const lastMod = fmtShipDate(new Date());
 
   const itemsXml = items.map(i => `
     <Item>
@@ -171,9 +187,9 @@ function minimalXML(o) {
   <Order>
     <OrderID>${esc(o.id)}</OrderID>
     <OrderNumber>${esc(o.name)}</OrderNumber>
-    <OrderDate>${new Date().toISOString().slice(0,19).replace("T"," ")}</OrderDate>
+    <OrderDate>${orderDate}</OrderDate>
     <OrderStatus>awaiting_shipment</OrderStatus>
-    <LastModified>${new Date().toISOString().slice(0,19).replace("T"," ")}</LastModified>
+    <LastModified>${lastMod}</LastModified>
     <ShippingMethod>Ground</ShippingMethod>
     <PaymentMethod>Other</PaymentMethod>
     <CurrencyCode>USD</CurrencyCode>
@@ -211,7 +227,7 @@ function minimalXML(o) {
 </Orders>`;
 }
 
-// === SHIPSTATION ===
+// === SHIPSTATION HANDLER ===
 function authOK(req){
   const h=req.headers.authorization||"";
   if(h.startsWith("Basic ")){
@@ -222,12 +238,16 @@ function authOK(req){
 }
 
 app.use("/shipstation", (req,res)=>{
-  res.set("Content-Type","application/xml");
-  if(!authOK(req)){ res.status(401).send("<Error>Auth</Error>"); return; }
+  res.set("Content-Type","application/xml; charset=utf-8");
+  if(!process.env.SS_USER || !process.env.SS_PASS || !authOK(req)){
+    res.status(401).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth failed</Error>`);
+    return;
+  }
+
   const id = req.query.order_id;
   const order = id ? bestById.get(String(id)) : history[history.length-1];
   res.send(minimalXML(order || {payload:{after:[]}}));
 });
 
 app.get("/health", (req,res)=>res.send("ok"));
-app.listen(process.env.PORT||8080, () => console.log("RUNNING"));
+app.listen(process.env.PORT||8080, () => console.log("Server running on port", process.env.PORT||8080));
