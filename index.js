@@ -21,7 +21,6 @@ function fmtShipDate(d=new Date()){
 function esc(x=""){ return String(x).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function money2(v){ return (Number.isFinite(v)?v:0).toFixed(2); }
 function sum(items){ return items.reduce((s,i)=>s+Number(i.unitPrice||0)*Number(i.qty||0),0); }
-
 function isBundleParent(li){
   const p=li.properties||[];
   if (p.find(x=>x.name==="_sb_parent" && String(x.value).toLowerCase()==="true")) return true;
@@ -113,16 +112,31 @@ function isSubscription(order) {
   if (order?.app_id === SKIO_APP_ID) return true;
   return false;
 }
-function looksLikeSimpleBundles(order){
-  const tags = String(order?.tags||"").toLowerCase();
-  const items = Array.isArray(order?.line_items) ? order.line_items : [];
-  const hasProp = items.some(li =>
-    Array.isArray(li.properties) &&
-    li.properties.some(p => ["_sb_bundle_variant_id_qty","_sb_components","_sb_child_id_qty"].includes(p.name))
-  );
-  return tags.includes("simple bundles") || tags.includes("simple bundles 2.0") || hasProp;
+function sbDetectFromOrder(order){
+  const items = Array.isArray(order.line_items) ? order.line_items : [];
+  const tagStr = String(order.tags || "").toLowerCase();
+  if (!items.length) return null;
+  const epsilon = 0.00001;
+  const daSum = li => (Array.isArray(li.discount_allocations) ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0) : 0);
+  const zeroed = li => (daSum(li) >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
+  const children = items.filter(li => zeroed(li));
+  const parents = items.filter(li => !zeroed(li));
+  if (children.length && parents.length === 1) {
+    return { parent: parents[0], children };
+  }
+  if (children.length && tagStr.includes("simple bundles")) {
+    return { parent: null, children };
+  }
+  const withPrice = items.filter(li => toNum(li.price) > 0);
+  const maxPrice = withPrice.length ? Math.max(...withPrice.map(li => toNum(li.price))) : 0;
+  const parentGuess = withPrice.find(li => toNum(li.price) === maxPrice) || null;
+  if (tagStr.includes("simple bundles") && parentGuess && items.length > 1) {
+    const rest = items.filter(li => li !== parentGuess);
+    return { parent: parentGuess, children: rest };
+  }
+  return null;
 }
-function pushLine(after, li, { unitPrice = null, parent = false, key = null, imageUrl = null } = {}){
+function pushLine(after, li, { unitPrice = null, parent = false, key = null } = {}){
   const price = unitPrice != null ? unitPrice : toNum(li.price);
   after.push({
     id: li.id,
@@ -131,72 +145,14 @@ function pushLine(after, li, { unitPrice = null, parent = false, key = null, ima
     qty: li.quantity || 1,
     unitPrice: price,
     parent,
-    key,
-    imageUrl: imageUrl || null
+    key
   });
 }
 
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
 const statusById=new Map();
-
-const variantInfoCache=new Map();
-const imageUrlCache=new Map();
-
-async function fetchVariantInfo(variantId){
-  const key=String(variantId);
-  if(variantInfoCache.has(key)) return variantInfoCache.get(key);
-  const shop=process.env.SHOPIFY_SHOP;
-  const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if(!shop||!token) return { price:0, productId:null, imageId:null, title:"", sku:"" };
-  const url=`https://${shop}/admin/api/2025-01/variants/${key}.json`;
-  const r=await fetch(url,{headers:{"X-Shopify-Access-Token":token,"Content-Type":"application/json"}});
-  if(!r.ok) { const v={price:0,productId:null,imageId:null,title:"",sku:""}; variantInfoCache.set(key,v); return v; }
-  const j=await r.json();
-  const v = {
-    price: toNum(j?.variant?.price),
-    productId: j?.variant?.product_id||null,
-    imageId: j?.variant?.image_id||null,
-    title: j?.variant?.title || "",
-    sku: (j?.variant?.sku || "").trim()
-  };
-  variantInfoCache.set(key,v);
-  return v;
-}
-
-async function fetchImageUrl(productId, imageId){
-  if(imageId){
-    const ik=`${productId}:${imageId}`;
-    if(imageUrlCache.has(ik)) return imageUrlCache.get(ik);
-    const shop=process.env.SHOPIFY_SHOP;
-    const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-    if(!shop||!token){ imageUrlCache.set(ik,""); return ""; }
-    const url=`https://${shop}/admin/api/2025-01/products/${productId}/images/${imageId}.json`;
-    const r=await fetch(url,{headers:{"X-Shopify-Access-Token":token,"Content-Type":"application/json"}});
-    if(!r.ok){ imageUrlCache.set(ik,""); return ""; }
-    const j=await r.json();
-    const src=String(j?.image?.src||"");
-    imageUrlCache.set(ik,src);
-    return src;
-  }
-  const pk=String(productId||"");
-  if(imageUrlCache.has(pk)) return imageUrlCache.get(pk);
-  const shop=process.env.SHOPIFY_SHOP;
-  const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if(!shop||!token){ imageUrlCache.set(pk,""); return ""; }
-  const url=`https://${shop}/admin/api/2025-01/products/${productId}.json`;
-  const r=await fetch(url,{headers:{"X-Shopify-Access-Token":token,"Content-Type":"application/json"}});
-  if(!r.ok){ imageUrlCache.set(pk,""); return ""; }
-  const j=await r.json();
-  const imgs=j?.product?.images||[];
-  const first=imgs.length?String(imgs[0].src||""):"";
-  imageUrlCache.set(pk,first);
-  return first;
-}
-
-async function fetchVariantPrice(variantId){
-  const info=await fetchVariantInfo(variantId);
-  return info.price||0;
-}
+const variantPriceCache=new Map();
+const imageCache=new Map();
 
 const bestById = new Map();
 function childrenCount(o){
@@ -207,103 +163,107 @@ function remember(e){
   while(history.length>100) history.shift();
   const key = String(e.id);
   const prev = bestById.get(key);
-  if (!prev || childrenCount(e) > childrenCount(prev)) {
+  if (!prev || childrenCount(e) >= childrenCount(prev)) {
     bestById.set(key, e);
   }
 }
 
-async function fetchBundleRecipe(productId, variantId){
+async function fetchVariantPrice(variantId){
+  const key=String(variantId);
+  if(variantPriceCache.has(key)) return variantPriceCache.get(key);
   const shop=process.env.SHOPIFY_SHOP;
   const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if(!shop||!token||!productId) return null;
-  const tryKeys=[
-    {ns:"simple_bundles_2_0", key:"components"},
-    {ns:"simple_bundles",     key:"components"},
-    {ns:"simplebundles",      key:"components"},
-    {ns:"bundles",            key:"components"},
-  ];
-  const gql = `
-  query($pid: ID!, $vKeys: [HasMetafieldsIdentifier!]!) {
-    product(id: $pid) {
-      id
-      metafields(identifiers: $vKeys){ namespace key value type }
-    }
-  }`;
-  const identifiers = tryKeys.map(k=>({namespace:k.ns,key:k.key}));
+  if(!shop||!token) return 0;
+  const url=`https://${shop}/admin/api/2025-01/variants/${key}.json`;
+  const r=await fetch(url,{headers:{"X-Shopify-Access-Token":token,"Content-Type":"application/json"}});
+  if(!r.ok) return 0;
+  const j=await r.json();
+  const price=toNum(j?.variant?.price);
+  variantPriceCache.set(key,price);
+  return price;
+}
+
+async function fetchVariantImage(productId, variantId){
+  const cacheKey = `${variantId||""}|${productId||""}`;
+  if (imageCache.has(cacheKey)) return imageCache.get(cacheKey);
+  const shop=process.env.SHOPIFY_SHOP;
+  const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if(!shop||!token) { imageCache.set(cacheKey,""); return ""; }
+  const vidGid = variantId ? `gid://shopify/ProductVariant/${variantId}` : null;
+  const pidGid = productId ? `gid://shopify/Product/${productId}` : null;
+  let query = "";
+  let variables = {};
+  if (vidGid && pidGid) {
+    query = `
+      query($vid: ID!, $pid: ID!) {
+        productVariant(id:$vid){ image{ url } }
+        product(id:$pid){ featuredImage{ url } }
+      }`;
+    variables = { vid: vidGid, pid: pidGid };
+  } else if (vidGid) {
+    query = `
+      query($vid: ID!) {
+        productVariant(id:$vid){ image{ url } }
+      }`;
+    variables = { vid: vidGid };
+  } else if (pidGid) {
+    query = `
+      query($pid: ID!) {
+        product(id:$pid){ featuredImage{ url } }
+      }`;
+    variables = { pid: pidGid };
+  } else {
+    imageCache.set(cacheKey,"");
+    return "";
+  }
   const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`,{
     method:"POST",
     headers:{ "X-Shopify-Access-Token":token, "Content-Type":"application/json" },
-    body: JSON.stringify({ query:gql, variables:{ pid:`gid://shopify/Product/${productId}`, vKeys:identifiers } })
+    body: JSON.stringify({ query, variables })
   });
-  if(!r.ok) return null;
+  if(!r.ok){ imageCache.set(cacheKey,""); return ""; }
   const j = await r.json();
-  const mfs = j?.data?.product?.metafields || [];
-  const mf = mfs.find(m=>m?.value);
-  if(!mf) return null;
-  let parsed=null;
-  try{ parsed = JSON.parse(mf.value); }catch(_){}
-  if(!parsed) return null;
-  const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.components)?parsed.components:[]);
-  const out=[];
-  for(const it of list){
-    const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//,"");
-    const qty = Number(it.quantity || it.qty || it.qty_each || 0);
-    if(vid && qty>0) out.push({ variantId: vid, qty });
+  const vUrl = j?.data?.productVariant?.image?.url || "";
+  const pUrl = j?.data?.product?.featuredImage?.url || "";
+  const url = vUrl || pUrl || "";
+  imageCache.set(cacheKey, url);
+  return url;
+}
+
+async function enrichImages(order, after){
+  const byId = new Map();
+  for(const li of (order.line_items||[])) byId.set(String(li.id), li);
+  for(const it of after){
+    let variantId = null, productId = null;
+    if (String(it.id).includes("::")) {
+      const parts = String(it.id).split("::");
+      const v = parts[1];
+      if (v && /^\d+$/.test(v)) variantId = v;
+    } else {
+      const src = byId.get(String(it.id));
+      if (src) {
+        if (src.variant_id) variantId = String(src.variant_id);
+        if (src.product_id) productId = String(src.product_id);
+      }
+    }
+    const url = await fetchVariantImage(productId, variantId);
+    it.imageUrl = url || "";
   }
-  return out.length ? out : null;
 }
 
 async function transformOrder(order){
   const after=[]; const handled=new Set();
 
-  if (looksLikeSimpleBundles(order)) {
-    const items = Array.isArray(order.line_items) ? order.line_items : [];
-    const seed = items.find(li =>
-      Array.isArray(li.properties) &&
-      li.properties.some(p => ["_sb_bundle_variant_id_qty","_sb_components","_sb_child_id_qty"].includes(p.name)
-    )) || null;
-
-    if (seed) {
-      const gkey = bundleKey(seed);
-      const group = gkey ? items.filter(li => bundleKey(li) === gkey) : [seed];
-
-      const union = new Map();
-      for (const li of group) {
-        const part = parseSbComponents(li);
-        for (const c of part) {
-          const q = toNum(c.qty);
-          if (!c.variantId || q <= 0) continue;
-          union.set(c.variantId, (union.get(c.variantId) || 0) + q);
-        }
-      }
-
-      const comps = Array.from(union.entries()).map(([variantId, qty]) => ({ variantId, qty }));
-      if (comps.length) {
-        const baseQty = Math.max(1, group.reduce((s, li) => s + toNum(li.quantity||0), 0)) || toNum(seed.quantity||1);
-        const key = gkey || `_sb_${seed.id}`;
-
-        for (const li of group) handled.add(li.id);
-
-        for (const c of comps) {
-          const info = await fetchVariantInfo(c.variantId);
-          const imageUrl = await fetchImageUrl(info.productId, info.imageId);
-          const qty = Math.max(1, toNum(c.qty) * (baseQty || 1));
-          after.push({
-            id: `${seed.id}::${c.variantId}`,
-            title: info.title ? `${seed.title} — ${info.title}` : seed.title,
-            sku: info.sku || seed.sku || null,
-            qty,
-            unitPrice: toNum(info.price || 0),
-            parent: false,
-            key,
-            imageUrl
-          });
-        }
-      }
+  const sb = sbDetectFromOrder(order);
+  if (sb) {
+    const { parent, children } = sb;
+    const key = parent ? (bundleKey(parent) || `_sb_${parent.id}`) : "_sb_auto";
+    if (parent) handled.add(parent.id);
+    for (const c of children) {
+      handled.add(c.id);
+      pushLine(after, c, { key });
     }
-  }
-
-  if (after.length === 0) {
+  } else {
     const groups={};
     for(const li of order.line_items||[]){
       const k=bundleKey(li); if(!k) continue;
@@ -319,17 +279,14 @@ async function transformOrder(order){
         for(const c of kids){ const p=toNum(c.price); (p>0?pricedKids:zeroKids).push(p>0?{c,p}:c); }
         if(zeroKids.length){
           for(const zk of zeroKids){
-            let vp=0; let img="";
-            const vid=zk.variant_id||zk.variantId||null;
-            if(vid){ const info=await fetchVariantInfo(vid); vp=toNum(info.price); img=await fetchImageUrl(info.productId, info.imageId); }
-            pricedKids.push({c:zk,p:toNum(vp),img});
+            let vp=0; const vid=zk.variant_id||zk.variantId||null;
+            if(vid) vp=await fetchVariantPrice(vid);
+            pricedKids.push({c:zk,p:toNum(vp)});
           }
         }
         if(pricedKids.some(x=>x.p>0)){
-          for(const {c,p,img} of pricedKids){
-            let imageUrl=img||"";
-            if(!imageUrl && c.variant_id){ const info=await fetchVariantInfo(c.variant_id); imageUrl=await fetchImageUrl(info.productId, info.imageId); }
-            after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:toNum(p),parent:false,key:k,imageUrl});
+          for(const {c,p} of pricedKids){
+            after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:toNum(p),parent:false,key:k});
           }
         }else{
           let qtySum=kids.reduce((s,c)=>s+(c.quantity||0),0);
@@ -340,29 +297,25 @@ async function transformOrder(order){
             const share=i===kids.length-1?rest:Math.round((totalParent*((c.quantity||0)/qtySum))*100);
             rest-=share;
             const unit=(c.quantity||1)>0?share/(c.quantity||1)/100:0;
-            let imageUrl="";
-            if(c.variant_id){ const info=await fetchVariantInfo(c.variant_id); imageUrl=await fetchImageUrl(info.productId, info.imageId); }
-            after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:Number(unit.toFixed(2)),parent:false,key:k,imageUrl});
+            after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:Number(unit.toFixed(2)),parent:false,key:k});
           }
         }
       }
     }
-
     if (after.length===0){
       for (const li of (order.line_items||[])) {
         const comps = parseSbComponents(li);
         if (!comps.length) continue;
         const priced=[]; let anyPrice=false;
         for(const c of comps){
-          const info=await fetchVariantInfo(c.variantId);
-          const price=toNum(info.price);
+          const vp=await fetchVariantPrice(c.variantId);
+          const price=toNum(vp);
           if(price>0) anyPrice=true;
-          priced.push({variantId:c.variantId, qty:c.qty, price, info});
+          priced.push({variantId:c.variantId, qty:c.qty, price});
         }
         if(anyPrice){
           for(const x of priced){
-            const imageUrl=await fetchImageUrl(x.info.productId, x.info.imageId);
-            after.push({ id:`${li.id}::${x.variantId}`, title:li.title, sku:x.info.sku||li.sku||null, qty:x.qty, unitPrice:toNum(x.price), parent:false, key:bundleKey(li)||`_sb_${li.id}`, imageUrl });
+            after.push({ id:`${li.id}::${x.variantId}`, title:li.title, sku:li.sku||null, qty:x.qty, unitPrice:toNum(x.price), parent:false, key:bundleKey(li)||`_sb_${li.id}` });
           }
         }else{
           const total=toNum(li.price)*(li.quantity||1);
@@ -373,9 +326,7 @@ async function transformOrder(order){
             const share=i===comps.length-1?rest:Math.round((total*((c.qty||0)/qtySum))*100);
             rest-=share;
             const unit=(c.qty||1)>0?share/(c.qty||1)/100:0;
-            const info=await fetchVariantInfo(c.variantId);
-            const imageUrl=await fetchImageUrl(info.productId, info.imageId);
-            after.push({ id:`${li.id}::${c.variantId}`, title:li.title, sku:info.sku||li.sku||null, qty:c.qty||1, unitPrice:Number(unit.toFixed(2)), parent:false, key:bundleKey(li)||`_sb_${li.id}`, imageUrl });
+            after.push({ id:`${li.id}::${c.variantId}`, title:li.title, sku:li.sku||null, qty:c.qty||1, unitPrice:Number(unit.toFixed(2)), parent:false, key:bundleKey(li)||`_sb_${li.id}` });
           }
         }
         handled.add(li.id);
@@ -385,39 +336,124 @@ async function transformOrder(order){
 
   for(const li of (order.line_items||[])){
     if(handled.has(li.id)) continue;
-    const info = li.variant_id ? await fetchVariantInfo(li.variant_id) : {productId:null,imageId:null,sku:li.sku||""};
-    const imageUrl = await fetchImageUrl(info.productId, info.imageId);
     after.push({
       id:li.id,
       title:li.title,
-      sku:info.sku || li.sku || null,
+      sku:li.sku||null,
       qty:li.quantity||1,
       unitPrice:toNum(li.price),
       parent:false,
-      key:bundleKey(li),
-      imageUrl
+      key:bundleKey(li)
     });
   }
-
   if (after.length===0){
     for(const li of (order.line_items||[])){
-      const info = li.variant_id ? await fetchVariantInfo(li.variant_id) : {productId:null,imageId:null,sku:li.sku||""};
-      const imageUrl = await fetchImageUrl(info.productId, info.imageId);
+      const base = toNum(li.price);
+      const fetched = li.variant_id ? await fetchVariantPrice(li.variant_id) : 0;
+      const price = base>0 ? base : toNum(fetched);
       after.push({
         id: li.id,
         title: li.title,
-        sku: info.sku || li.sku || null,
+        sku: li.sku || null,
         qty: li.quantity || 1,
-        unitPrice: toNum(li.price),
+        unitPrice: price,
         parent: false,
-        key: bundleKey(li),
-        imageUrl
+        key: bundleKey(li)
       });
     }
   }
-
+  await enrichImages(order, after);
   return { after };
 }
+
+app.post("/webhooks/orders-create", async (req,res)=>{
+  try{
+    const raw=await getRawBody(req);
+    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
+    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
+    const order=JSON.parse(raw.toString("utf8"));
+    const topic=String(req.headers["x-shopify-topic"]||"");
+    const shop=String(req.headers["x-shopify-shop-domain"]||"");
+    const items=Array.isArray(order?.line_items)?order.line_items:[];
+    console.log(JSON.stringify({
+      t: Date.now(),
+      topic,
+      shop,
+      order_id: order?.id,
+      sub: isSubscription(order) ? 1 : 0,
+      hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
+      app_id: order?.app_id,
+      tags: order?.tags,
+      liProps: items.map(it => ({
+        id: it.id,
+        props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
+      }))
+    }));
+    const conv=await transformOrder(order);
+    remember({
+      id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
+      email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
+      payload:conv, created_at:order.created_at||new Date().toISOString()
+    });
+    statusById.set(order.id,"awaiting_shipment");
+    console.log("MATCH",order.id,order.name,"items:",conv.after.length);
+    res.status(200).send("ok");
+  }catch(e){ console.error(e); res.status(500).send("err"); }
+});
+
+app.post("/webhooks/orders-updated", async (req,res)=>{
+  try{
+    const raw=await getRawBody(req);
+    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
+    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
+    const order=JSON.parse(raw.toString("utf8"));
+    const topic=String(req.headers["x-shopify-topic"]||"");
+    const shop=String(req.headers["x-shopify-shop-domain"]||"");
+    const items=Array.isArray(order?.line_items)?order.line_items:[];
+    console.log(JSON.stringify({
+      t: Date.now(),
+      topic,
+      shop,
+      order_id: order?.id,
+      sub: isSubscription(order) ? 1 : 0,
+      hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
+      app_id: order?.app_id,
+      tags: order?.tags,
+      liProps: items.map(it => ({
+        id: it.id,
+        props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
+      }))
+    }));
+    const conv=await transformOrder(order);
+    remember({
+      id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
+      email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
+      payload:conv, created_at:order.created_at||new Date().toISOString()
+    });
+    statusById.set(order.id,"awaiting_shipment");
+    console.log("UPDATED MATCH",order.id,order.name,"items:",conv.after.length);
+    res.status(200).send("ok");
+  }catch(e){ console.error(e); res.status(500).send("err"); }
+});
+
+app.post("/webhooks/orders-cancelled", async (req,res)=>{
+  try{
+    const raw=await getRawBody(req);
+    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
+    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
+    const order=JSON.parse(raw.toString("utf8"));
+    statusById.set(order.id,"cancelled");
+    if(!last() || last().id!==order.id){
+      remember({
+        id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
+        email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
+        payload:{ after:[] }, created_at:order.created_at||new Date().toISOString()
+      });
+    }
+    console.log("CANCEL MATCH",order.id,order.name);
+    res.status(200).send("ok");
+  }catch(e){ console.error(e); res.status(500).send("err"); }
+});
 
 function minimalXML(o){
   if(!o) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
@@ -436,7 +472,7 @@ function minimalXML(o){
         <Quantity>${Math.max(1,parseInt(i.qty||0,10))}</Quantity>
         <UnitPrice>${money2(Number.isFinite(i.unitPrice)?i.unitPrice:0)}</UnitPrice>
         <Adjustment>false</Adjustment>
-        <ImageUrl>${esc(String(i.imageUrl||""))}</ImageUrl>
+        ${i.imageUrl ? `<ImageUrl>${esc(i.imageUrl)}</ImageUrl>` : ``}
       </Item>`).join("");
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
@@ -511,7 +547,7 @@ function shipstationHandler(req,res){
   if(!authOK(req)){ res.status(401).set("WWW-Authenticate","Basic").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`); return; }
   const q=Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k.toLowerCase(),String(v)]));
   const action=(q.action||"").toLowerCase();
-  if(action==="test"||action==="status"){ res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`); return; }
+  if(action==="test"||"status"){ res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`); return; }
   if (q.order_id) {
     const wanted = String(q.order_id);
     const best = bestById.get(wanted);
@@ -520,21 +556,7 @@ function shipstationHandler(req,res){
     res.status(200).send(xml);
     return;
   }
-  let o = null;
-  {
-    const all = Array.from(bestById.values());
-    if (all.length) {
-      all.sort((a, b) => {
-        const ca = childrenCount(a), cb = childrenCount(b);
-        if (cb !== ca) return cb - ca;
-        const ta = Date.parse(a.created_at||0), tb = Date.parse(b.created_at||0);
-        return tb - ta;
-      });
-      o = all[0];
-    } else {
-      o = last() || null;
-    }
-  }
+  let o=last();
   if(!o && String(process.env.SS_SAMPLE_ON_EMPTY||"").toLowerCase()==="true"){ o=buildSampleOrder(); }
   const strict=String(process.env.SS_STRICT_DATES||"").toLowerCase()==="true";
   if(o && strict){
