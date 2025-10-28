@@ -6,12 +6,14 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
+// === УТИЛИТЫ ===
 function hmacOk(raw, header, secret) {
   if (!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
   const a = Buffer.from(header), b = Buffer.from(sig);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
 function toNum(x){ const n = Number.parseFloat(String(x||"0")); return Number.isFinite(n)?n:0; }
 function fmtShipDate(d=new Date()){
   const t=new Date(d); const pad=n=>String(n).padStart(2,"0");
@@ -36,6 +38,7 @@ function skuSafe(i, orderId){
   return `MW-${orderId}-${base}`;
 }
 
+// === ПОИСК variant_id В СВОЙСТВАХ ===
 function getVariantIdFromProperties(li) {
   const props = li.properties || [];
   const keys = ["_sb_variant_id", "variant_id", "_bundle_variant_id", "component_variant_id"];
@@ -49,15 +52,71 @@ function getVariantIdFromProperties(li) {
   return null;
 }
 
+// === ПОИСК variant_id ПО SKU ===
+async function findVariantIdBySku(sku){
+  if (!sku) return null;
+
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if(!shop||!token) return null;
+
+  const cacheKey = `sku:${sku}`;
+  if(variantDetailsCache.has(cacheKey)) {
+    const cached = variantDetailsCache.get(cacheKey);
+    return cached.variantId || null;
+  }
+
+  try {
+    const gql = `
+      query {
+        productVariants(first: 1, query: "sku:${sku}") {
+          edges {
+            node {
+              id
+              legacyResourceId
+              image { url }
+              product { images(first: 1) { edges { node { url } } } }
+            }
+          }
+        }
+      }
+    `;
+
+    const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+      method: "POST",
+      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: gql })
+    });
+
+    if (r.ok) {
+      const j = await r.json();
+      const variant = j.data?.productVariants?.edges?.[0]?.node;
+      if (variant) {
+        const variantId = variant.legacyResourceId;
+        const imageUrl = variant.image?.url || variant.product?.images?.edges?.[0]?.node?.url || "";
+        variantDetailsCache.set(cacheKey, { variantId, imageUrl });
+        return variantId;
+      }
+    }
+  } catch (e) {
+    console.error("SKU lookup error:", e);
+  }
+
+  return null;
+}
+
+// === SB ЛОГИКА ===
 function sbDetectFromOrder(order){
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   const tagStr = String(order.tags || "").toLowerCase();
   if (!items.length) return null;
+
   const epsilon = 0.00001;
   const daSum = li => (Array.isArray(li.discount_allocations) ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0) : 0);
   const zeroed = li => (daSum(li) >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
   const children = items.filter(li => zeroed(li));
   const parents = items.filter(li => !zeroed(li));
+
   if (children.length && parents.length === 1) {
     return { parent: parents[0], children };
   }
@@ -80,11 +139,11 @@ function pushLine(after, li, { unitPrice = null, key = null, imageUrl = null } =
   });
 }
 
+// === КЭШИ ===
 const history = [];
 const last = () => history.length ? history[history.length-1] : null;
 const statusById = new Map();
 const variantDetailsCache = new Map();
-const productImagesCache = new Map();
 const bestById = new Map();
 
 function remember(e){
@@ -97,71 +156,144 @@ function remember(e){
   }
 }
 
-async function fetchProductFirstImageUrl(shop, token, productId){
-  const pk = String(productId);
-  if (productImagesCache.has(pk)) return productImagesCache.get(pk);
-  const res = await fetch(`https://${shop}/admin/api/2025-01/products/${productId}.json?fields=images`, { headers: { "X-Shopify-Access-Token": token } });
-  if (!res.ok) { productImagesCache.set(pk, ""); return ""; }
-  const j = await res.json();
-  const url = j?.product?.images?.[0]?.src || "";
-  productImagesCache.set(pk, url || "");
-  return url || "";
-}
-async function fetchProductImageById(shop, token, productId, imageId){
-  const key = `${productId}:${imageId}`;
-  if (productImagesCache.has(key)) return productImagesCache.get(key);
-  const res = await fetch(`https://${shop}/admin/api/2025-01/products/${productId}/images/${imageId}.json`, { headers: { "X-Shopify-Access-Token": token } });
-  if (!res.ok) { productImagesCache.set(key, ""); return ""; }
-  const j = await res.json();
-  const url = j?.image?.src || "";
-  productImagesCache.set(key, url || "");
-  return url || "";
-}
-
+// === GRAPHQL + REST + FALLBACK ДЛЯ КАРТИНОК ===
 async function fetchVariantDetails(variantId){
   const key = String(variantId);
   if(variantDetailsCache.has(key)) return variantDetailsCache.get(key);
+
   const shop = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if(!shop||!token) { const d={price:0,imageUrl:""}; variantDetailsCache.set(key,d); return d; }
-  let price = 0;
+  if(!shop||!token) return {price: 0, imageUrl: ""};
+
   let imageUrl = "";
-  let productId = null;
-  let imageId = null;
-  const vRes = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, { headers: { "X-Shopify-Access-Token": token } });
-  if (vRes.ok) {
-    const vj = await vRes.json();
-    const v = vj?.variant;
-    price = toNum(v?.price);
-    productId = v?.product_id || null;
-    imageId = v?.image_id || null;
-    if (productId && imageId) {
-      imageUrl = await fetchProductImageById(shop, token, productId, imageId);
+  let price = 0;
+
+  // 1. GraphQL
+  const gql = `
+    query($id: ID!) {
+      productVariant(id: $id) {
+        price
+        image {
+          url
+          src
+          transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
+        }
+        product {
+          featuredImage {
+            url
+            src
+            transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
+          }
+          images(first: 1) {
+            edges {
+              node {
+                url
+                src
+                transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
+              }
+            }
+          }
+        }
+      }
     }
-    if (!imageUrl && productId) {
-      imageUrl = await fetchProductFirstImageUrl(shop, token, productId);
+  `;
+
+  try {
+    const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+      method: "POST",
+      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: gql, variables: { id: `gid://shopify/ProductVariant/${variantId}` } })
+    });
+
+    if (r.ok) {
+      const j = await r.json();
+      const v = j.data?.productVariant;
+      price = toNum(v?.price);
+
+      const img = v?.image;
+      imageUrl = img?.url || img?.src || img?.transformedSrc;
+
+      if (!imageUrl) {
+        const prodImg = v?.product?.featuredImage || v?.product?.images?.edges?.[0]?.node;
+        imageUrl = prodImg?.url || prodImg?.src || prodImg?.transformedSrc;
+      }
     }
+  } catch (e) {
+    console.error("GraphQL error:", e);
   }
-  const details = { price, imageUrl };
+
+  // 2. REST fallback
+  if (!imageUrl) {
+    try {
+      const restUrl = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
+      const restRes = await fetch(restUrl, {headers: {"X-Shopify-Access-Token": token}});
+      if (restRes.ok) {
+        const restJson = await restRes.json();
+        const variant = restJson.variant;
+        imageUrl = variant?.image?.src || "";
+        if (!imageUrl && variant?.product_id) {
+          const prodRes = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`, {
+            headers: {"X-Shopify-Access-Token": token}
+          });
+          if (prodRes.ok) {
+            const prodJson = await prodRes.json();
+            imageUrl = prodJson.product?.images?.[0]?.src || "";
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  const details = {price, imageUrl};
   variantDetailsCache.set(key, details);
+
+  console.log("FETCHED VARIANT", { variantId, price, imageUrl: imageUrl ? "OK" : "MISSING" });
+
   return details;
 }
 
+// === TRANSFORM ORDER ===
 async function transformOrder(order){
   const after = [];
   const handled = new Set();
+
   const sb = sbDetectFromOrder(order);
   if (sb) {
     const { children } = sb;
+
     for (const c of children) {
       handled.add(c.id);
+
       let vid = c.variant_id || c.variantId || null;
-      if (!vid) vid = getVariantIdFromProperties(c);
+      if (!vid) {
+        vid = getVariantIdFromProperties(c);
+      }
+      if (!vid && c.sku) {
+        vid = await findVariantIdBySku(c.sku);
+      }
+
       const details = vid ? await fetchVariantDetails(vid) : {price: 0, imageUrl: ""};
+      if (!details.imageUrl && c.sku) {
+        const skuDetails = variantDetailsCache.get(`sku:${c.sku}`);
+        if (skuDetails?.imageUrl) details.imageUrl = skuDetails.imageUrl;
+      }
+
       pushLine(after, c, { imageUrl: details.imageUrl });
+
+      console.log("SB CHILD", { 
+        lineItemId: c.id, 
+        title: c.title, 
+        sku: c.sku,
+        variantId: vid, 
+        imageUrl: details.imageUrl ? "OK" : "MISSING" 
+      });
     }
+
+    console.log("SB-DETECT", { count: after.length });
     return { after };
   }
+
+  // Обычные товары
   for(const li of (order.line_items||[])){
     if(handled.has(li.id)) continue;
     const vid = li.variant_id || null;
@@ -176,9 +308,11 @@ async function transformOrder(order){
       imageUrl: details.imageUrl
     });
   }
+
   return { after };
 }
 
+// === ВЕБХУКИ ===
 app.post("/webhooks/orders-create", async (req,res)=>{
   try{
     const raw=await getRawBody(req);
@@ -228,8 +362,10 @@ app.post("/webhooks/orders-cancelled", async (req,res)=>{
   }catch(e){ console.error(e); res.status(500).send("err"); }
 });
 
+// === XML ДЛЯ SHIPSTATION ===
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
+
   const items = o.payload.after.map(item => ({
     id: item.id || "UNKNOWN",
     title: item.title || "Item",
@@ -238,16 +374,19 @@ function minimalXML(o) {
     unitPrice: Number.isFinite(item.unitPrice) ? item.unitPrice : 0,
     imageUrl: item.imageUrl || ""
   }));
+
   const subtotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const tax = 0;
   const shipping = 0;
   const total = subtotal + tax + shipping;
+
   const bill = filledAddress(o.billing_address || {});
   const ship = filledAddress(o.shipping_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
   const lastMod = fmtShipDate(new Date());
   const status = statusById.get(o.id) || "awaiting_shipment";
+
   const itemsXml = items.map(i => `
       <Item>
         <LineItemID>${esc(String(i.id))}</LineItemID>
@@ -258,6 +397,7 @@ function minimalXML(o) {
         <ImageUrl>${esc(i.imageUrl)}</ImageUrl>
         <Adjustment>false</Adjustment>
       </Item>`).join("");
+
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
   <Order>
@@ -304,6 +444,7 @@ function minimalXML(o) {
 </Orders>`;
 }
 
+// === SHIPSTATION HANDLER ===
 function authOK(req){
   const h=req.headers.authorization||"";
   if(h.startsWith("Basic ")){
@@ -320,15 +461,18 @@ function shipstationHandler(req,res){
   res.set({"Content-Type":"application/xml; charset=utf-8"});
   if(!process.env.SS_USER||!process.env.SS_PASS){ res.status(503).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth not configured</Error>`); return; }
   if(!authOK(req)){ res.status(401).set("WWW-Authenticate","Basic").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`); return; }
+
   const q=Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k.toLowerCase(),String(v)]));
   const action=(q.action||"").toLowerCase();
   if(action==="test"||action==="status"){ res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`); return; }
+
   if (q.order_id) {
     const wanted = String(q.order_id);
     const found = bestById.get(wanted) || history.slice().reverse().find(o => String(o.id) === wanted);
     res.status(200).send(minimalXML(found || null));
     return;
   }
+
   const xml = minimalXML(last());
   res.status(200).send(xml);
 }
