@@ -6,7 +6,6 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
-// ===== utils
 function hmacOk(raw, header, secret) {
   if (!header) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -14,14 +13,23 @@ function hmacOk(raw, header, secret) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 function pickMark(order) {
-  const note = String(order.note || "");
+  const note = String(order?.note || "");
   const mT = note.match(/__MW_THEME\s*=\s*([^\s;]+)/i);
   const mD = note.match(/__MW_DEBUG\s*=\s*([^\s;]+)/i);
   if (mT) return { theme: mT[1], debug: !!(mD && mD[1].toLowerCase() === "on") };
-  const attrs = Object.fromEntries((order.attributes || []).map(a => [a.name, a.value]));
-  if (attrs.__MW_THEME) return { theme: attrs.__MW_THEME, debug: attrs.__MW_DEBUG === "on" };
+
+  const rawAttrs = order?.note_attributes || order?.attributes || [];
+  const dict = Object.fromEntries(
+    (Array.isArray(rawAttrs) ? rawAttrs : [])
+      .map(a => [String(a.name || a.key || "").trim(), String(a.value ?? "").trim()])
+  );
+
+  if (dict.__MW_THEME) {
+    return { theme: dict.__MW_THEME, debug: (dict.__MW_DEBUG || "").toLowerCase() === "on" };
+  }
   return null;
 }
+
 function toNum(x){ const n = Number.parseFloat(String(x||"0")); return Number.isFinite(n)?n:0; }
 function fmtShipDate(d=new Date()){
   const t=new Date(d); const pad=n=>String(n).padStart(2,"0");
@@ -38,11 +46,63 @@ function isBundleParent(li){
   return false;
 }
 function bundleKey(li){
-  const p=li.properties||[];
-  const f1=p.find(x=>["_sb_bundle_id","bundle_id","_bundle_id","skio_bundle_id"].includes(x.name));
-  if (f1) return String(f1.value);
-  const f2=p.find(x=>["_sb_key","bundle_key","skio_bundle_key"].includes(x.name));
-  return f2?String(f2.value):null;
+  const p = li.properties || [];
+  const get = n => {
+    const f = p.find(x => x.name === n);
+    return f ? String(f.value) : null;
+  };
+  let v =
+    get("_sb_bundle_id") ||
+    get("bundle_id") ||
+    get("_bundle_id") ||
+    get("skio_bundle_id") ||
+    get("_sb_key") ||
+    get("bundle_key") ||
+    get("skio_bundle_key");
+  if (!v) {
+    const g = get("_sb_bundle_group");
+    if (g) v = String(g).split(" ")[0];
+  }
+  return v;
+}
+function parseSbComponents(li) {
+  const props = Array.isArray(li?.properties) ? li.properties : [];
+  const rawVals = props
+    .filter(p =>
+      ["_sb_bundle_variant_id_qty", "_sb_components", "_sb_child_id_qty"].includes(p.name)
+    )
+    .map(p => String(p.value))
+    .filter(Boolean);
+  const out = [];
+  for (const v of rawVals) {
+    const s = v.trim();
+    if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
+      try {
+        const parsed = JSON.parse(s);
+        const arr = Array.isArray(parsed) ? parsed : [parsed];
+        for (const it of arr) {
+          const vid = String(it.variant_id || it.variantId || "").replace(/^gid:\/\/shopify\/ProductVariant\//, "");
+          const qty = Number(it.qty || it.quantity || it.qty_each || it.count || 0);
+          if (vid && qty > 0) out.push({ variantId: vid, qty });
+        }
+      } catch (_) {}
+    }
+  }
+  const flat = rawVals.join("|");
+  if (flat) {
+    const parts = flat.split(/[,;|]/).map(x => x.trim()).filter(Boolean);
+    for (const p of parts) {
+      const m = p.match(/^(?:gid:\/\/shopify\/ProductVariant\/)?(\d+)\s*:\s*(\d+)$/i);
+      if (m) out.push({ variantId: m[1], qty: Number(m[2]) || 0 });
+    }
+  }
+  const dedup = new Map();
+  for (const r of out) {
+    if (!r.variantId || r.qty <= 0) continue;
+    const k = r.variantId;
+    dedup.set(k, (dedup.get(k) || 0) + r.qty);
+  }
+  return [...dedup.entries()].map(([variantId, qty]) => ({ variantId, qty }));
 }
 function normState(s){ const v=(s||"").trim(); if(!v) return "ST"; return v.length===2?v:v.slice(0,2).toUpperCase(); }
 function filledAddress(a){
@@ -60,17 +120,129 @@ function skuSafe(i, orderId){
   const base=i.id?String(i.id):(i.title?i.title.replace(/\s+/g,"-").slice(0,24):"ITEM");
   return `MW-${orderId}-${base}`;
 }
+function isSubscription(order) {
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  if (items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id)) return true;
+  const tags = String(order?.tags || "").toLowerCase();
+  if (tags.includes("subscription")) return true;
+  const SKIO_APP_ID = 580111;
+  if (order?.app_id === SKIO_APP_ID) return true;
+  return false;
+}
+function sbDetectFromOrder(order){
+  const items = Array.isArray(order.line_items) ? order.line_items : [];
+  const tagStr = String(order.tags || "").toLowerCase();
+  if (!items.length) return null;
+  const epsilon = 0.00001;
+  const daSum = li => (Array.isArray(li.discount_allocations) ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0) : 0);
+  const zeroed = li => (daSum(li) >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
+  const children = items.filter(li => zeroed(li));
+  const parents = items.filter(li => !zeroed(li));
+  if (children.length && parents.length === 1) {
+    return { parent: parents[0], children };
+  }
+  if (children.length && tagStr.includes("simple bundles")) {
+    return { parent: null, children };
+  }
+  const withPrice = items.filter(li => toNum(li.price) > 0);
+  const maxPrice = withPrice.length ? Math.max(...withPrice.map(li => toNum(li.price))) : 0;
+  const parentGuess = withPrice.find(li => toNum(li.price) === maxPrice) || null;
+  if (tagStr.includes("simple bundles") && parentGuess && items.length > 1) {
+    const rest = items.filter(li => li !== parentGuess);
+    return { parent: parentGuess, children: rest };
+  }
+  return null;
+}
+function pushLine(after, li, { unitPrice = null, parent = false, key = null } = {}){
+  const price = unitPrice != null ? unitPrice : toNum(li.price);
+  after.push({
+    id: li.id,
+    title: li.title,
+    sku: li.sku || null,
+    qty: li.quantity || 1,
+    unitPrice: price,
+    parent,
+    key
+  });
+}
 
-// ===== memory
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
-function remember(e){ history.push(e); while(history.length>100) history.shift(); }
-// статус заказа (id -> awaiting_shipment | cancelled)
 const statusById=new Map();
+const variantPriceCache=new Map();
 
-// ===== transform
-function transformOrder(order){
+// keep the best version per order_id (max children count)
+const bestById = new Map();
+function childrenCount(o){
+  return Array.isArray(o?.payload?.after) ? o.payload.after.filter(i => !i.parent).length : 0;
+}
+function remember(e){
+  history.push(e);
+  while(history.length>100) history.shift();
+  const key = String(e.id);
+  const prev = bestById.get(key);
+  if (!prev || childrenCount(e) >= childrenCount(prev)) {
+    bestById.set(key, e);
+  }
+}
+
+async function fetchVariantPrice(variantId){
+  const key=String(variantId);
+  if(variantPriceCache.has(key)) return variantPriceCache.get(key);
+  const shop=process.env.SHOPIFY_SHOP;
+  const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if(!shop||!token) return 0;
+  const url=`https://${shop}/admin/api/2025-01/variants/${key}.json`;
+  const r=await fetch(url,{headers:{"X-Shopify-Access-Token":token,"Content-Type":"application/json"}});
+  if(!r.ok) return 0;
+  const j=await r.json();
+  const price=toNum(j?.variant?.price);
+  variantPriceCache.set(key,price);
+  return price;
+}
+async function fetchBundleRecipe(productId, variantId){
+  const shop=process.env.SHOPIFY_SHOP;
+  const token=process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if(!shop||!token||!productId) return null;
+  const tryKeys=[
+    {ns:"simple_bundles_2_0", key:"components"},
+    {ns:"simple_bundles",     key:"components"},
+    {ns:"simplebundles",      key:"components"},
+    {ns:"bundles",            key:"components"},
+  ];
+  const gql = `
+  query($pid: ID!, $vKeys: [HasMetafieldsIdentifier!]!) {
+    product(id: $pid) {
+      id
+      metafields(identifiers: $vKeys){ namespace key value type }
+    }
+  }`;
+  const identifiers = tryKeys.map(k=>({namespace:k.ns,key:k.key}));
+  const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`,{
+    method:"POST",
+    headers:{ "X-Shopify-Access-Token":token, "Content-Type":"application/json" },
+    body: JSON.stringify({ query:gql, variables:{ pid:`gid://shopify/Product/${productId}`, vKeys:identifiers } })
+  });
+  if(!r.ok) return null;
+  const j = await r.json();
+  const mfs = j?.data?.product?.metafields || [];
+  const mf = mfs.find(m=>m?.value);
+  if(!mf) return null;
+  let parsed=null;
+  try{ parsed = JSON.parse(mf.value); }catch(_){}
+  if(!parsed) return null;
+  const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.components)?parsed.components:[]);
+  const out=[];
+  for(const it of list){
+    const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//,"");
+    const qty = Number(it.quantity || it.qty || it.qty_each || 0);
+    if(vid && qty>0) out.push({ variantId: vid, qty });
+  }
+  return out.length ? out : null;
+}
+
+async function transformOrder(order){
   const groups={};
-  for(const li of order.line_items){
+  for(const li of order.line_items||[]){
     const k=bundleKey(li); if(!k) continue;
     if(!groups[k]) groups[k]={parent:null,children:[]};
     if(isBundleParent(li)) groups[k].parent=li; else groups[k].children.push(li);
@@ -80,69 +252,228 @@ function transformOrder(order){
     const parent=g.parent, kids=g.children;
     if(parent) handled.add(parent.id); for(const c of kids) handled.add(c.id);
     if(parent && kids.length>0){
-      const total=toNum(parent.price)*parent.quantity;
-      let qtySum=0; for(const c of kids) qtySum+=c.quantity;
-      after.push({id:parent.id,title:parent.title,sku:parent.sku||null,qty:parent.quantity,unitPrice:0,parent:true,key:k});
-      if(total>0 && qtySum>0){
-        let rest=Math.round(total*100);
+      const totalParent=toNum(parent.price)* (parent.quantity||1);
+      const pricedKids=[]; const zeroKids=[];
+      for(const c of kids){ const p=toNum(c.price); (p>0?pricedKids:zeroKids).push(p>0?{c,p}:c); }
+      if(zeroKids.length){
+        for(const zk of zeroKids){
+          let vp=0; const vid=zk.variant_id||zk.variantId||null;
+          if(vid) vp=await fetchVariantPrice(vid);
+          pricedKids.push({c:zk,p:toNum(vp)});
+        }
+      }
+      if(pricedKids.some(x=>x.p>0)){
+        for(const {c,p} of pricedKids){
+          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:toNum(p),parent:false,key:k});
+        }
+      }else{
+        let qtySum=kids.reduce((s,c)=>s+(c.quantity||0),0);
+        qtySum=Math.max(1,qtySum);
+        let rest=Math.round(totalParent*100);
         for(let i=0;i<kids.length;i++){
           const c=kids[i];
-          const share=i===kids.length-1?rest:Math.round((total*(c.quantity/qtySum))*100);
+          const share=i===kids.length-1?rest:Math.round((totalParent*((c.quantity||0)/qtySum))*100);
           rest-=share;
-          const unit=c.quantity>0?share/c.quantity/100:0;
-          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity,unitPrice:Number(unit.toFixed(2)),parent:false,key:k});
+          const unit=(c.quantity||1)>0?share/(c.quantity||1)/100:0;
+          after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity||1,unitPrice:Number(unit.toFixed(2)),parent:false,key:k});
         }
-      } else {
-        for(const c of kids){ after.push({id:c.id,title:c.title,sku:c.sku||null,qty:c.quantity,unitPrice:toNum(c.price),parent:false,key:k}); }
       }
     }
   }
-  for(const li of order.line_items){
+  const sb = sbDetectFromOrder(order);
+  if (sb) {
+    const { parent, children } = sb;
+    const key = parent ? (bundleKey(parent) || `_sb_${parent.id}`) : "_sb_auto";
+    if (parent) handled.add(parent.id);
+    for (const c of children) {
+      handled.add(c.id);
+      pushLine(after, c, { key });
+    }
+    console.log("SB-DETECT", { parent: parent?.id || null, children: children.map(c=>c.id) });
+  }
+  const hasAnyGroup = Object.keys(groups).length > 0;
+  if (!hasAnyGroup && !sb){
+    for (const li of (order.line_items||[])) {
+      const comps = parseSbComponents(li);
+      if (!comps.length) continue;
+      const priced=[]; let anyPrice=false;
+      for(const c of comps){
+        const vp=await fetchVariantPrice(c.variantId);
+        const price=toNum(vp);
+        if(price>0) anyPrice=true;
+        priced.push({variantId:c.variantId, qty:c.qty, price});
+      }
+      if(anyPrice){
+        for(const x of priced){
+          after.push({ id:`${li.id}::${x.variantId}`, title:li.title, sku:li.sku||null, qty:x.qty, unitPrice:toNum(x.price), parent:false, key:bundleKey(li)||`_sb_${li.id}` });
+        }
+      }else{
+        const total=toNum(li.price)*(li.quantity||1);
+        const qtySum=Math.max(1, comps.reduce((s,c)=>s+(c.qty||0),0));
+        let rest=Math.round(total*100);
+        for(let i=0;i<comps.length;i++){
+          const c=comps[i];
+          const share=i===comps.length-1?rest:Math.round((total*((c.qty||0)/qtySum))*100);
+          rest-=share;
+          const unit=(c.qty||1)>0?share/(c.qty||1)/100:0;
+          after.push({ id:`${li.id}::${c.variantId}`, title:li.title, sku:li.sku||null, qty:c.qty||1, unitPrice:Number(unit.toFixed(2)), parent:false, key:bundleKey(li)||`_sb_${li.id}` });
+        }
+      }
+      handled.add(li.id);
+    }
+  }
+  if (after.length===0) {
+    const parentOnly = (order.line_items||[]).length===1;
+    if (parentOnly) {
+      const li = order.line_items[0];
+      const comps = await fetchBundleRecipe(li.product_id, li.variant_id);
+      if (Array.isArray(comps) && comps.length) {
+        handled.add(li.id);
+        after.push({ id:li.id, title:li.title, sku:li.sku||null, qty:li.quantity||1, unitPrice:0, parent:true, key:bundleKey(li)||`_sb_${li.id}` });
+        for (const c of comps){
+          const vp = await fetchVariantPrice(c.variantId);
+          const price = toNum(vp);
+          after.push({ id:`${li.id}::${c.variantId}`, title:li.title, sku:li.sku||null, qty:(c.qty||1)*(li.quantity||1), unitPrice:price, parent:false, key:bundleKey(li)||`_sb_${li.id}` });
+        }
+      }
+    }
+  }
+  for(const li of (order.line_items||[])){
     if(handled.has(li.id)) continue;
-    after.push({id:li.id,title:li.title,sku:li.sku||null,qty:li.quantity,unitPrice:toNum(li.price),parent:false,key:bundleKey(li)});
+    after.push({
+      id:li.id,
+      title:li.title,
+      sku:li.sku||null,
+      qty:li.quantity||1,
+      unitPrice:toNum(li.price),
+      parent:false,
+      key:bundleKey(li)
+    });
+  }
+  if (after.length===0){
+    for(const li of (order.line_items||[])){
+      const base = toNum(li.price);
+      const fetched = li.variant_id ? await fetchVariantPrice(li.variant_id) : 0;
+      const price = base>0 ? base : toNum(fetched);
+      after.push({
+        id: li.id,
+        title: li.title,
+        sku: li.sku || null,
+        qty: li.quantity || 1,
+        unitPrice: price,
+        parent: false,
+        key: bundleKey(li)
+      });
+    }
   }
   return { after };
 }
 
-// ===== webhooks
 app.post("/webhooks/orders-create", async (req,res)=>{
-  const raw=await getRawBody(req);
-  const hdr=req.headers["x-shopify-hmac-sha256"]||"";
-  if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
-  const order=JSON.parse(raw.toString("utf8"));
-  const mark=pickMark(order);
-  if(!mark || !String(mark.theme||"").startsWith("preview-")){ console.log("skip",order.id,order.name); res.status(200).send("skip"); return; }
-  const conv=transformOrder(order);
-  remember({
-    id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
-    email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
-    payload:conv, created_at:order.created_at||new Date().toISOString()
-  });
-  statusById.set(order.id,"awaiting_shipment");
-  console.log("MATCH",order.id,order.name,"items:",conv.after.length);
-  res.status(200).send("ok");
-});
-
-app.post("/webhooks/orders-cancelled", async (req,res)=>{
-  const raw=await getRawBody(req);
-  const hdr=req.headers["x-shopify-hmac-sha256"]||"";
-  if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
-  const order=JSON.parse(raw.toString("utf8"));
-  const mark=pickMark(order);
-  if(!mark || !String(mark.theme||"").startsWith("preview-")){ console.log("cancel skip",order.id,order.name); res.status(200).send("skip"); return; }
-  statusById.set(order.id,"cancelled");
-  if(!last() || last().id!==order.id){
+  try{
+    const raw=await getRawBody(req);
+    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
+    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
+    const order=JSON.parse(raw.toString("utf8"));
+    const mark=pickMark(order);
+    const topic=String(req.headers["x-shopify-topic"]||"");
+    const shop=String(req.headers["x-shopify-shop-domain"]||"");
+    const items=Array.isArray(order?.line_items)?order.line_items:[];
+    console.log(JSON.stringify({
+      t: Date.now(),
+      topic,
+      shop,
+      order_id: order?.id,
+      sub: isSubscription(order) ? 1 : 0,
+      hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
+      app_id: order?.app_id,
+      tags: order?.tags,
+      liProps: items.map(it => ({
+        id: it.id,
+        props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
+      }))
+    }));
+    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
+    if (!inPreview) {
+      console.log("skip", order.id, order.name);
+      res.status(200).send("skip");
+      return;
+    }
+    const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
       email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
-      payload:{ after:[] }, created_at:order.created_at||new Date().toISOString()
+      payload:conv, created_at:order.created_at||new Date().toISOString()
     });
-  }
-  console.log("CANCEL MATCH",order.id,order.name);
-  res.status(200).send("ok");
+    statusById.set(order.id,"awaiting_shipment");
+    console.log("MATCH",order.id,order.name,"items:",conv.after.length);
+    res.status(200).send("ok");
+  }catch(e){ console.error(e); res.status(500).send("err"); }
 });
 
-// ===== XML
+app.post("/webhooks/orders-updated", async (req,res)=>{
+  try{
+    const raw=await getRawBody(req);
+    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
+    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
+    const order=JSON.parse(raw.toString("utf8"));
+    const mark=pickMark(order);
+    const topic=String(req.headers["x-shopify-topic"]||"");
+    const shop=String(req.headers["x-shopify-shop-domain"]||"");
+    const items=Array.isArray(order?.line_items)?order.line_items:[];
+    console.log(JSON.stringify({
+      t: Date.now(),
+      topic,
+      shop,
+      order_id: order?.id,
+      sub: isSubscription(order) ? 1 : 0,
+      hasSellingPlan: items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id),
+      app_id: order?.app_id,
+      tags: order?.tags,
+      liProps: items.map(it => ({
+        id: it.id,
+        props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
+      }))
+    }));
+    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
+    if (!inPreview) {
+      console.log("skip-updated", order.id, order.name);
+      res.status(200).send("skip");
+      return;
+    }
+    const conv=await transformOrder(order);
+    remember({
+      id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
+      email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
+      payload:conv, created_at:order.created_at||new Date().toISOString()
+    });
+    statusById.set(order.id,"awaiting_shipment");
+    console.log("UPDATED MATCH",order.id,order.name,"items:",conv.after.length);
+    res.status(200).send("ok");
+  }catch(e){ console.error(e); res.status(500).send("err"); }
+});
+
+app.post("/webhooks/orders-cancelled", async (req,res)=>{
+  try{
+    const raw=await getRawBody(req);
+    const hdr=req.headers["x-shopify-hmac-sha256"]||"";
+    if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
+    const order=JSON.parse(raw.toString("utf8"));
+    const mark=pickMark(order);
+    if(!(mark && String(mark.theme||"").startsWith("preview-"))){ console.log("cancel skip",order.id,order.name); res.status(200).send("skip"); return; }
+    statusById.set(order.id,"cancelled");
+    if(!last() || last().id!==order.id){
+      remember({
+        id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
+        email:order.email||"", shipping_address:order.shipping_address||{}, billing_address:order.billing_address||{},
+        payload:{ after:[] }, created_at:order.created_at||new Date().toISOString()
+      });
+    }
+    console.log("CANCEL MATCH",order.id,order.name);
+    res.status(200).send("ok");
+  }catch(e){ console.error(e); res.status(500).send("err"); }
+});
+
 function minimalXML(o){
   if(!o) return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
   let children=(o.payload?.after||[]).filter(i=>!i.parent);
@@ -152,7 +483,6 @@ function minimalXML(o){
   const email=(o.email&&o.email.includes("@"))?o.email:"customer@example.com";
   const orderDate=fmtShipDate(new Date(o.created_at||Date.now())), lastMod=fmtShipDate(new Date());
   const status=statusById.get(o.id) || "awaiting_shipment";
-
   const itemsXml=children.map(i=>`
       <Item>
         <LineItemID>${esc(String(i.id||""))}</LineItemID>
@@ -162,7 +492,6 @@ function minimalXML(o){
         <UnitPrice>${money2(Number.isFinite(i.unitPrice)?i.unitPrice:0)}</UnitPrice>
         <Adjustment>false</Adjustment>
       </Item>`).join("");
-
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
   <Order>
@@ -209,7 +538,6 @@ function minimalXML(o){
 </Orders>`;
 }
 
-// ===== auth + handler
 function authOK(req){
   const h=req.headers.authorization||"";
   if(h.startsWith("Basic ")){
@@ -232,27 +560,29 @@ function buildSampleOrder(){
   };
 }
 function shipstationHandler(req,res){
-  console.log("[SS] hit", req.method, req.originalUrl);
   res.set({"Content-Type":"application/xml; charset=utf-8","Cache-Control":"no-store, no-cache, must-revalidate, max-age=0","Pragma":"no-cache","Expires":"0"});
   if(!process.env.SS_USER||!process.env.SS_PASS){ res.status(503).send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth not configured</Error>`); return; }
   if(!authOK(req)){ res.status(401).set("WWW-Authenticate","Basic").send(`<?xml version="1.0" encoding="utf-8"?><Error>Auth</Error>`); return; }
-
   const q=Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k.toLowerCase(),String(v)]));
   const action=(q.action||"").toLowerCase();
   if(action==="test"||action==="status"){ res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Store><Status>OK</Status></Store>`); return; }
-
+  if (q.order_id) {
+    const wanted = String(q.order_id);
+    const best = bestById.get(wanted);
+    const found = best || history.slice().reverse().find(o => String(o.id) === wanted);
+    const xml = minimalXML(found || null);
+    res.status(200).send(xml);
+    return;
+  }
   let o=last();
   if(!o && String(process.env.SS_SAMPLE_ON_EMPTY||"").toLowerCase()==="true"){ o=buildSampleOrder(); }
-
   const strict=String(process.env.SS_STRICT_DATES||"").toLowerCase()==="true";
   if(o && strict){
     const start=q.start_date?Date.parse(q.start_date):null;
     const end=q.end_date?Date.parse(q.end_date):null;
     if((start && Date.parse(o.created_at)<start) || (end && Date.parse(o.created_at)>end)){ o=null; }
   }
-
   const xml=minimalXML(o);
-  console.log("[SS] xml(export):", xml.slice(0,300).replace(/\s+/g," ").trim());
   res.status(200).send(xml);
 }
 
