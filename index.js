@@ -12,33 +12,6 @@ function hmacOk(raw, header, secret) {
   const a = Buffer.from(header), b = Buffer.from(sig);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
-function pickMark(order) {
-  const note = String(order?.note || "");
-  const mT = note.match(/__MW_THEME\s*=\s*([^\s;]+)/i);
-  const mD = note.match(/__MW_DEBUG\s*=\s*([^\s;]+)/i);
-  if (mT) return { theme: mT[1], debug: !!(mD && mD[1].toLowerCase() === "on") };
-
-  const rawAttrs = order?.note_attributes || order?.attributes || [];
-  const dict = Object.fromEntries(
-    (Array.isArray(rawAttrs) ? rawAttrs : [])
-      .map(a => [String(a.name || a.key || "").trim(), String(a.value ?? "").trim()])
-  );
-
-  if (dict.__MW_THEME) {
-    return { theme: dict.__MW_THEME, debug: (dict.__MW_DEBUG || "").toLowerCase() === "on" };
-  }
-  if (!dict.__MW_THEME && Array.isArray(order?.line_items)) {
-  for (const li of order.line_items) {
-    const props = Array.isArray(li.properties) ? li.properties : [];
-    const map = Object.fromEntries(props.map(p => [String(p.name||p.key||''), String(p.value||'')]));
-    if (map.__MW_THEME) {
-      return { theme: map.__MW_THEME, debug: (map.__MW_DEBUG||'').toLowerCase() === 'on' };
-    }
-  }
-}
-
-  return null;
-}
 
 function toNum(x){ const n = Number.parseFloat(String(x||"0")); return Number.isFinite(n)?n:0; }
 function fmtShipDate(d=new Date()){
@@ -186,12 +159,9 @@ function sbDetectFromOrder(order){
   return null;
 }
 
-
 const history=[]; const last=()=>history.length?history[history.length-1]:null;
 const statusById=new Map();
 const variantPriceCache=new Map();
-
-// keep the best version per order_id (max children count)
 const bestById = new Map();
 function childrenCount(o){
   return Array.isArray(o?.payload?.after) ? o.payload.after.filter(i => !i.parent).length : 0;
@@ -408,7 +378,6 @@ app.post("/webhooks/orders-create", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
-    const mark=pickMark(order);
     const topic=String(req.headers["x-shopify-topic"]||"");
     const shop=String(req.headers["x-shopify-shop-domain"]||"");
     const items=Array.isArray(order?.line_items)?order.line_items:[];
@@ -426,12 +395,6 @@ app.post("/webhooks/orders-create", async (req,res)=>{
         props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
       }))
     }));
-    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
-    if (!inPreview) {
-      console.log("skip", order.id, order.name);
-      res.status(200).send("skip");
-      return;
-    }
     const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
@@ -450,7 +413,6 @@ app.post("/webhooks/orders-updated", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
-    const mark=pickMark(order);
     const topic=String(req.headers["x-shopify-topic"]||"");
     const shop=String(req.headers["x-shopify-shop-domain"]||"");
     const items=Array.isArray(order?.line_items)?order.line_items:[];
@@ -468,12 +430,6 @@ app.post("/webhooks/orders-updated", async (req,res)=>{
         props: Array.isArray(it.properties) ? it.properties.map(p => p.name) : []
       }))
     }));
-    const inPreview = mark && String(mark.theme||"").startsWith("preview-");
-    if (!inPreview) {
-      console.log("skip-updated", order.id, order.name);
-      res.status(200).send("skip");
-      return;
-    }
     const conv=await transformOrder(order);
     remember({
       id:order.id, name:order.name, currency:order.currency, total_price:toNum(order.total_price),
@@ -492,8 +448,6 @@ app.post("/webhooks/orders-cancelled", async (req,res)=>{
     const hdr=req.headers["x-shopify-hmac-sha256"]||"";
     if(!hmacOk(raw,hdr,process.env.SHOPIFY_WEBHOOK_SECRET||"")){ res.status(401).send("bad hmac"); return; }
     const order=JSON.parse(raw.toString("utf8"));
-    const mark=pickMark(order);
-    if(!(mark && String(mark.theme||"").startsWith("preview-"))){ console.log("cancel skip",order.id,order.name); res.status(200).send("skip"); return; }
     statusById.set(order.id,"cancelled");
     if(!last() || last().id!==order.id){
       remember({
