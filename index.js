@@ -114,16 +114,79 @@ function getLastOrder() {
 
 // === КАРТИНКА ПО VARIANT_ID (API + Fallback) ===
 async function getVariantImage(variantId) {
-  if (!variantId) return "";
+  if (!variantId) {
+    console.log("getVariantImage: NO variant_id");
+    return "";
+  }
   const key = String(variantId);
-  if (variantImageCache.has(key)) return variantImageCache.get(key);
+  if (variantImageCache.has(key)) {
+    const cached = variantImageCache.get(key);
+    console.log(`CACHE HIT variant:${variantId} → ${cached || "EMPTY"}`);
+    return cached;
+  }
 
   const shop = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if (!shop || !token) {
+
+  if (!shop) {
+    console.log("MISSING SHOPIFY_SHOP in .env");
     variantImageCache.set(key, "");
     return "";
   }
+  if (!token) {
+    console.log("MISSING SHOPIFY_ADMIN_ACCESS_TOKEN in .env");
+    variantImageCache.set(key, "");
+    return "";
+  }
+
+  const url = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
+  console.log(`FETCHING: ${url}`);
+
+  try {
+    const res = await fetch(url, {
+      headers: { "X-Shopify-Access-Token": token }
+    });
+
+    console.log(`API RESPONSE: ${res.status} ${res.statusText}`);
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.log(`API ERROR BODY: ${errText}`);
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    const variant = data.variant;
+    if (!variant) {
+      console.log("NO variant in response");
+      variantImageCache.set(key, "");
+      return "";
+    }
+
+    let imageUrl = variant.image?.src || "";
+    console.log(`VARIANT IMAGE: ${imageUrl || "NONE"}`);
+
+    if (!imageUrl && variant.product_id) {
+      console.log(`FALLBACK: fetching product ${variant.product_id}`);
+      const prodRes = await fetch(
+        `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`,
+        { headers: { "X-Shopify-Access-Token": token } }
+      );
+      if (prodRes.ok) {
+        const p = await prodRes.json();
+        imageUrl = p.product.images?.[0]?.src || "";
+        console.log(`PRODUCT IMAGE: ${imageUrl || "NONE"}`);
+      }
+    }
+
+    variantImageCache.set(key, imageUrl);
+    return imageUrl;
+  } catch (e) {
+    console.error(`IMAGE FETCH FAILED (variant ${variantId}):`, e.message);
+    variantImageCache.set(key, "");
+    return "";
+  }
+}
 
   try {
     const res = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, {
