@@ -101,20 +101,27 @@ async function fetchVariantDetails(variantId){
   let imageUrl = "";
   let price = 0;
 
-  // 1. GraphQL
+  // 1. GraphQL — с transformedSrc и src
   const gql = `
     query($id: ID!) {
       productVariant(id: $id) {
         price
         image {
           url
+          src
           transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
         }
         product {
+          featuredImage {
+            url
+            src
+            transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
+          }
           images(first: 1) {
             edges {
               node {
                 url
+                src
                 transformedSrc(maxWidth: 500, maxHeight: 500, crop: CENTER)
               }
             }
@@ -136,28 +143,52 @@ async function fetchVariantDetails(variantId){
       const v = j.data?.productVariant;
       price = toNum(v?.price);
 
-      imageUrl = v?.image?.url || v?.image?.transformedSrc;
+      // Попробуем все возможные поля
+      const img = v?.image;
+      imageUrl = img?.url || img?.src || img?.transformedSrc;
+
       if (!imageUrl) {
-        const firstImg = v?.product?.images?.edges?.[0]?.node;
-        imageUrl = firstImg?.url || firstImg?.transformedSrc;
+        const prodImg = v?.product?.featuredImage || v?.product?.images?.edges?.[0]?.node;
+        imageUrl = prodImg?.url || prodImg?.src || prodImg?.transformedSrc;
       }
     }
-  } catch (_) {}
+  } catch (e) {
+    console.error("GraphQL error:", e);
+  }
 
-  // 2. REST fallback
+  // 2. REST fallback (на всякий случай)
   if (!imageUrl) {
     try {
       const restUrl = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
       const restRes = await fetch(restUrl, {headers: {"X-Shopify-Access-Token": token}});
       if (restRes.ok) {
         const restJson = await restRes.json();
-        imageUrl = restJson.variant?.image?.src || "";
+        const variant = restJson.variant;
+        imageUrl = variant?.image?.src || "";
+        if (!imageUrl && variant?.product_id) {
+          const prodRes = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`, {
+            headers: {"X-Shopify-Access-Token": token}
+          });
+          if (prodRes.ok) {
+            const prodJson = await prodRes.json();
+            imageUrl = prodJson.product?.images?.[0]?.src || "";
+          }
+        }
       }
     } catch (_) {}
   }
 
+  // 3. Финальный fallback: CDN URL по variant_id (если есть)
+  if (!imageUrl && variantId) {
+    imageUrl = `https://cdn.shopify.com/s/files/1/0000/0000/${variantId}_500x500.jpg`;
+  }
+
   const details = {price, imageUrl};
   variantDetailsCache.set(key, details);
+
+  // ЛОГ ДЛЯ ОТЛАДКИ
+  console.log("FETCHED VARIANT", { variantId, price, imageUrl: imageUrl ? "OK" : "MISSING" });
+
   return details;
 }
 
