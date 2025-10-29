@@ -1,226 +1,256 @@
-// scanner_runtime.js  (ESM)
+const SHOP = process.env.SHOPIFY_SHOP;
+const TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
-// --- Настройки и известные метаполя Simple Bundles ---
-const COMPONENT_FIELDS = [
+const SB_NS_CANDIDATES = [
   { ns: "simple_bundles_2_0", key: "components" },
   { ns: "simple_bundles",     key: "components" },
   { ns: "simplebundles",      key: "components" },
-  { ns: "bundles",            key: "components" },
+  { ns: "bundles",            key: "components" }
 ];
-
-// Овверайды: какой продукт считать источником рецепта для другого
-const OVERRIDES = {
-  "product:10345847423286": "product:10353217306934",
+// Product-level overrides: read recipe from another product, but store under the original
+const PRODUCT_RECIPE_OVERRIDES = {
+  "10345847423286": "10353217306934"
 };
 
-// --- Вспомогательные ---
-function toNum(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; }
-function shopHeaders(){
-  const shop  = process.env.SHOPIFY_SHOP;
-  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if (!shop || !token) throw new Error("SHOPIFY creds missing");
-  return {
-    shop,
-    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
-  };
-}
-async function fetchJson(path){
-  const { shop, headers } = shopHeaders();
-  const url = `https://${shop}${path}`;
-  const r = await fetch(url, { headers });
-  if (!r.ok) {
-    const body = await r.text().catch(()=> "");
-    throw new Error(`HTTP ${r.status} ${r.statusText} ${body}`);
+
+function toNum(x){ const n=Number(x); return Number.isFinite(n)?n:0; }
+
+async function adminFetch(path){
+  const url = `https://${SHOP}/admin/api/2025-01${path}`;
+  const r = await fetch(url,{ headers:{ "X-Shopify-Access-Token":TOKEN, "Content-Type":"application/json" }});
+  if(!r.ok){
+    const t = await r.text().catch(()=> "");
+    throw new Error(`HTTP ${r.status} ${r.statusText} ${t}`);
   }
-  return r.json();
+  return r;
 }
 
-function parseComponentsValue(val){
-  if (!val) return [];
-  const s = String(val).trim();
-  const out = [];
+async function listAllProducts(){
+  const out=[]; let since=0;
+  for(;;){
+    const r = await adminFetch(`/products.json?fields=id&limit=250${since?`&since_id=${since}`:""}`);
+    const j = await r.json();
+    const arr = Array.isArray(j.products)?j.products:[];
+    if(!arr.length) break;
+    for(const p of arr) out.push({id:p.id});
+    since = arr[arr.length-1].id;
+    if(arr.length<250) break;
+  }
+  return out;
+}
 
-  // JSON массив/объект
-  if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
-    try {
-      const parsed = JSON.parse(s);
-      const arr = Array.isArray(parsed) ? parsed : (parsed.components || []);
-      for (const it of arr) {
-        const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//, "");
-        const qty = toNum(it.quantity ?? it.qty ?? it.qty_each ?? 0);
-        if (vid && qty > 0) out.push({ variantId: vid, qty });
+async function listProductVariants(productId){
+  const r = await adminFetch(`/products/${productId}.json?fields=variants`);
+  const j = await r.json();
+  const v = Array.isArray(j.product?.variants)?j.product.variants:[];
+  return v.map(x=>({id:x.id}));
+}
+
+async function listProductMetafields(productId){
+  let out=[]; let page=null;
+  for(;;){
+    const r = await adminFetch(`/products/${productId}/metafields.json?limit=250${page?`&page_info=${encodeURIComponent(page)}`:""}`);
+    const j = await r.json();
+    const arr = Array.isArray(j.metafields)?j.metafields:[];
+    out = out.concat(arr.map(m=>({namespace:m.namespace,key:m.key,value:m.value,type:m.type})));
+    const link=r.headers.get("link")||"";
+    const m=link.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/i);
+    if(m){ page=m[1]; continue; }
+    break;
+  }
+  return out;
+}
+
+async function listVariantMetafields(variantId){
+  let out=[]; let page=null;
+  for(;;){
+    const r = await adminFetch(`/variants/${variantId}/metafields.json?limit=250${page?`&page_info=${encodeURIComponent(page)}`:""}`);
+    const j = await r.json();
+    const arr = Array.isArray(j.metafields)?j.metafields:[];
+    out = out.concat(arr.map(m=>({namespace:m.namespace,key:m.key,value:m.value,type:m.type})));
+    const link=r.headers.get("link")||"";
+    const m=link.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/i);
+    if(m){ page=m[1]; continue; }
+    break;
+  }
+  return out;
+}
+
+/* === Ослабленная валидация: принимаем любое большое число или gid === */
+function extractVariantId(raw){
+  if (!raw) return null;
+  const s = String(raw).trim();
+  const m1 = s.match(/ProductVariant\/(\d+)/i);
+  if (m1) return m1[1];
+  const m2 = s.match(/^(\d{6,})$/); // 6+ цифр
+  return m2 ? m2[1] : null;
+}
+
+/* Без knownVariantIds: дети могут быть из других продуктов */
+function normalizeRecipe(list){
+  const out=[];
+  for(const it of list||[]){
+    const vid = extractVariantId(it.variantId ?? it.variant_id ?? it.id);
+    const qty = Math.max(1, Number(it.qty ?? it.quantity ?? it.qty_each ?? 1));
+    if(vid) out.push({ variantId: vid, qty });
+  }
+  return out;
+}
+
+function parseRecipeFromValue(value, type){
+  // product_variant_reference / list.product_reference.* — достаём gid/числа
+  if (String(type||"").includes("product_variant_reference")) {
+    try{
+      const parsed = JSON.parse(String(value));
+      const arr = Array.isArray(parsed)?parsed:[parsed];
+      const tmp=[];
+      for(const it of arr){
+        const vid = extractVariantId(it?.id ?? it);
+        if(vid) tmp.push({ variantId: vid, qty: 1 });
       }
-    } catch(_) {}
+      return normalizeRecipe(tmp);
+    }catch(_){
+      const tmp=[];
+      for(const token of String(value||"").split(/[\s,;|]+/)){
+        const vid = extractVariantId(token);
+        if(vid) tmp.push({ variantId: vid, qty: 1 });
+      }
+      return normalizeRecipe(tmp);
+    }
   }
 
-  // Плоский список "vid:qty" через запятые/точки с запятой/|
-  const parts = s.split(/[,;|]/).map(x => x.trim()).filter(Boolean);
-  for (const p of parts) {
-    const m = p.match(/^(?:gid:\/\/shopify\/ProductVariant\/)?(\d+)\s*:\s*(\d+)$/i);
-    if (m) out.push({ variantId: m[1], qty: toNum(m[2]) });
-  }
+  // JSON массив/объект с components
+  try{
+    const parsed = JSON.parse(String(value));
+    const arr = Array.isArray(parsed) ? parsed
+              : (Array.isArray(parsed?.components)? parsed.components : null);
+    if(arr && arr.length){
+      const tmp=[];
+      for(const it of arr){
+        const vid = extractVariantId(it?.variantId ?? it?.variant_id ?? it?.id);
+        const qty = Math.max(1, Number(it?.qty ?? it?.quantity ?? it?.qty_each ?? 1));
+        if(vid) tmp.push({ variantId: vid, qty });
+      }
+      return normalizeRecipe(tmp);
+    }
+  }catch(_){}
 
-  // дедупликация
-  const map = new Map();
-  for (const r of out) {
-    if (!r.variantId || r.qty <= 0) continue;
-    map.set(r.variantId, (map.get(r.variantId) || 0) + r.qty);
-  }
-  return [...map.entries()].map(([variantId, qty]) => ({ variantId, qty }));
-}
-
-// --- Загрузка метаполей ---
-async function getProductMetafields(productId){
-  const j = await fetchJson(`/admin/api/2025-01/products/${productId}/metafields.json`);
-  return Array.isArray(j?.metafields) ? j.metafields : [];
-}
-async function getVariantMetafields(variantId){
-  const j = await fetchJson(`/admin/api/2025-01/variants/${variantId}/metafields.json`);
-  return Array.isArray(j?.metafields) ? j.metafields : [];
-}
-async function getProductVariants(productId){
-  const j = await fetchJson(`/admin/api/2025-01/products/${productId}.json?fields=variants`);
-  return Array.isArray(j?.product?.variants) ? j.product.variants : [];
-}
-
-// Парсим рецепт из набора метаполей
-function extractRecipeFromMetafields(mfs){
-  for (const f of COMPONENT_FIELDS) {
-    const mf = mfs.find(m => m.namespace === f.ns && m.key === f.key && m.value);
-    if (!mf) continue;
-    const comps = parseComponentsValue(mf.value);
-    if (comps.length) return comps;
+  // Плоская строка вида "12345:2,67890:1" или с gid
+  const flat = String(value||"");
+  if(flat){
+    const tmp=[];
+    for(const token of flat.split(/[,;|]/)){
+      const t = token.trim();
+      const m = t.match(/(?:ProductVariant\/)?(\d{6,})\s*:\s*(\d+)/i);
+      if(m) tmp.push({ variantId: m[1], qty: Number(m[2])||1 });
+      else{
+        const vid = extractVariantId(t);
+        if(vid) tmp.push({ variantId: vid, qty: 1 });
+      }
+    }
+    return normalizeRecipe(tmp);
   }
   return [];
 }
 
-// --- Кэш ---
-const _bundleMapCache = new Map(); // key: productId string
-
-function applyProductOverride(rawProductId){
-  const k = `product:${String(rawProductId)}`;
-  const mapped = OVERRIDES[k];
-  if (!mapped) return { effectiveProductId: String(rawProductId), aliasFrom: null };
-  const m = String(mapped);
-  if (m.startsWith("product:")) return { effectiveProductId: m.slice("product:".length), aliasFrom: String(rawProductId) };
-  return { effectiveProductId: m, aliasFrom: String(rawProductId) };
+function pickRecipeFromMetafields(mfs){
+  if(!Array.isArray(mfs) || !mfs.length) return [];
+  for(const cand of SB_NS_CANDIDATES){
+    const mf = mfs.find(m=>m.namespace===cand.ns && m.key===cand.key && m.value);
+    if(mf){
+      const r = parseRecipeFromValue(mf.value, mf.type);
+      if(r.length) return r;
+    }
+  }
+  for(const mf of mfs){
+    if(!mf?.value) continue;
+    const r = parseRecipeFromValue(mf.value, mf.type);
+    if(r.length) return r;
+  }
+  return [];
 }
 
-/**
- * Собирает карту рецептов:
- *  - ключи: "product:<id>" и "variant:<variant_id>"
- *  - значения: массив [{ variantId, qty }]
- * @param {{onlyProductId?: string|null}} opts
- * @returns {Promise<Record<string, Array<{variantId:string, qty:number}>>>}
- */
-export async function buildBundleMap(opts = {}){
-  const onlyProductId = opts.onlyProductId ? String(opts.onlyProductId) : null;
+/* ===== Публичные функции ===== */
 
-  // если просили конкретный продукт — применяем овверайд
-  let scanProductId = null;
-  let aliasFrom = null;
-  if (onlyProductId) {
-    const mapped = applyProductOverride(onlyProductId);
-    scanProductId = mapped.effectiveProductId;
-    aliasFrom = mapped.aliasFrom; // если отличается — ниже сделаем алиас
+export async function dumpMeta(productId){
+  const variants = await listProductVariants(productId);
+  const product_metafields = await listProductMetafields(productId);
+  const product_recipe = pickRecipeFromMetafields(product_metafields);
+
+  const variant_recipes = {};
+  for(const v of variants){
+    const m = await listVariantMetafields(v.id);
+    variant_recipes[v.id] = pickRecipeFromMetafields(m);
   }
 
-  // кэш по конкретному продукту
-  const cacheKey = scanProductId ? `pid:${scanProductId}` : "*ALL*";
-  if (_bundleMapCache.has(cacheKey)) return _bundleMapCache.get(cacheKey);
+  return {
+    ok:true,
+    product_id:String(productId),
+    product_recipe,
+    variants: variants.map(v=>({id:v.id})),
+    variant_recipes,
+    product_metafields
+  };
+}
 
-  const out = {}; // { "product:ID": [...], "variant:VID":[...] }
+export async function buildBundleMap({ onlyProductId=null, onlyVariantId=null } = {}){
+  const out={};
 
-  const productIds = [];
-  if (scanProductId) {
-    productIds.push(scanProductId);
-  } else {
-    // если нужен глобальный прогон — забираем продукты постранично (минимально)
-    // тут можно расширить при необходимости
-    // для текущей задачи достаточно работать по one-shot продукту
-    // но оставим возможность расширения
-  }
-
-  // если нет конкретного продукта — выходим пустыми (чтобы не грузить всё)
-  if (!productIds.length && !scanProductId) {
-    _bundleMapCache.set(cacheKey, out);
+  if(onlyVariantId){
+    const r = await adminFetch(`/variants/${onlyVariantId}.json?fields=product_id`);
+    const j = await r.json();
+    if(!j?.variant?.product_id) return out;
+    const mfs = await listVariantMetafields(onlyVariantId);
+    const rec = pickRecipeFromMetafields(mfs);
+    if(rec.length) out[`variant:${onlyVariantId}`]=rec;
     return out;
   }
 
-  // сбор по каждому продукту
-  for (const pid of productIds) {
-    try {
-      const mfs = await getProductMetafields(pid);
-      const productRecipe = extractRecipeFromMetafields(mfs);
+if(onlyProductId){
+  const scanProductId = PRODUCT_RECIPE_OVERRIDES[String(onlyProductId)] || onlyProductId;
 
-      // product-level рецепт (редко, но вдруг)
-      if (productRecipe.length) {
-        out[`product:${pid}`] = productRecipe;
-      }
+  // читаем МФ у "донорского" продукта (scanProductId), но сохраняем под ключом оригинала
+  const pMfs = await listProductMetafields(scanProductId);
+  const pRec = pickRecipeFromMetafields(pMfs);
+  if(pRec.length) out[`product:${onlyProductId}`]=pRec;
 
-      // variant-level рецепты
-      const variants = await getProductVariants(pid);
-      for (const v of variants) {
-        try {
-          const vId = String(v.id);
-          const vmf = await getVariantMetafields(vId);
-          const vRecipe = extractRecipeFromMetafields(vmf);
-          if (vRecipe.length) {
-            out[`variant:${vId}`] = vRecipe;
-          }
-        } catch (e) {
-          // пропускаем конкретный вариант
-        }
-      }
-
-      // если запрошен алиас (овверайд) — продублируем ключ product:<aliasFrom> к product:<pid>
-      if (aliasFrom) {
-        const srcKey = `product:${pid}`;
-        const dstKey = `product:${aliasFrom}`;
-        if (out[srcKey] && !out[dstKey]) {
-          out[dstKey] = out[srcKey];
-        }
-      }
-
-    } catch (e) {
-      // пропускаем продукт
-    }
+  // варианты читаем у того же "донорского" продукта, но храним как варианты оригинала не нужно.
+  // Для совместимости — просто добавим варианты донора как есть:
+  const vars = await listProductVariants(scanProductId);
+  for(const v of vars){
+    const mfs = await listVariantMetafields(v.id);
+    const r = pickRecipeFromMetafields(mfs);
+    if(r.length) out[`variant:${v.id}`]=r;
   }
-
-  _bundleMapCache.set(cacheKey, out);
   return out;
 }
 
-/**
- * Диагностический дамп метаполей по продукту + вариантам
- * @param {string} productId
- * @returns {Promise<object>}
- */
-export async function dumpMeta(productId){
-  const pid = String(productId);
-  try {
-    const mfs = await getProductMetafields(pid);
-    const product_recipe = extractRecipeFromMetafields(mfs);
 
-    const variants = await getProductVariants(pid);
-    const variant_recipes = {};
-    for (const v of variants) {
-      try {
-        const vmf = await getVariantMetafields(String(v.id));
-        variant_recipes[String(v.id)] = extractRecipeFromMetafields(vmf);
-      } catch {
-        variant_recipes[String(v.id)] = [];
-      }
-    }
 
-    return {
-      ok: true,
-      product_id: pid,
-      product_recipe,
-      variants: variants.map(v => ({ id: v.id })),
-      variant_recipes
-    };
-  } catch (e) {
-    return { ok: false, error: String(e.message || e), product_id: pid };
+  const okIds=[]; const missIds=[];
+  const products = await listAllProducts();
+for(const p of products){
+  let found=false;
+
+  const scanProductId = PRODUCT_RECIPE_OVERRIDES[String(p.id)] || p.id;
+
+  // читаем у "донорского" продукта
+  const pMfs = await listProductMetafields(scanProductId);
+  const pRec = pickRecipeFromMetafields(pMfs);
+  if(pRec.length){ out[`product:${p.id}`]=pRec; found=true; }
+
+  const vars = await listProductVariants(scanProductId);
+  for(const v of vars){
+    const mfs = await listVariantMetafields(v.id);
+    const r = pickRecipeFromMetafields(mfs);
+    if(r.length){ out[`variant:${v.id}`]=r; found=true; }
   }
+
+  if(found) okIds.push(String(p.id)); else missIds.push(String(p.id));
+}
+
+  out["__REPORT_OK"]=okIds;
+  out["__REPORT_MISS"]=missIds;
+  out["__stats"]={ total:products.length, ok:okIds.length, miss:missIds.length };
+  return out;
 }
