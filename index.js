@@ -166,6 +166,12 @@ function sbDetectFromOrder(order) {
   const children = new Set();
   for (const arr of groups.values()) {
     if (arr.length < 2) continue;
+        const hasBundleKey = arr.every(x => !!bundleKey(x));
+    if (hasBundleKey && arr.length >= 2) {
+      arr.forEach(li => children.add(li));
+      continue;
+    }
+
     const zeros = arr.filter(zeroed);
     if (zeros.length) {
       zeros.forEach(li => children.add(li));
