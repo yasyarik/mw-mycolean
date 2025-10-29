@@ -329,6 +329,8 @@ function isMWOrder(order, conv){
     if (conv && Array.isArray(conv.after) && conv.after.length !== origCount) return true;
 
     const tags = String(order?.tags || "").toLowerCase();
+    if (tags.includes("subscription")) return true;
+
     if (tags.includes("simple bundles")) return true;
 
     const epsilon = 0.00001;
@@ -519,6 +521,7 @@ async function transformOrder(order) {
     tags.includes("simple bundles") ||
     tags.includes("bundle") ||
     tags.includes("skio") ||
+      tags.includes("subscription") ||
     tags.includes("aftersell");
 
   const sb = sbDetectFromOrder(order);
