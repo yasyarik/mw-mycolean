@@ -669,6 +669,22 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
+    // различаем create vs update по пути
+const isUpdateWebhook = req.path && req.path.indexOf("/webhooks/orders-updated") !== -1;
+const isCreateWebhook = req.path && req.path.indexOf("/webhooks/orders-create") !== -1;
+
+// для CREATE — помечаем как «свежий» (входит в окно последних N)
+if (isCreateWebhook) {
+  touchRecent(order);
+}
+
+// для UPDATE — обрабатываем только если этот заказ уже в окне последних
+if (isUpdateWebhook && !isOrderRecent(order.id)) {
+  console.log(`[ORDER ${order.id} ${order.name || ''}] SKIP UPDATE (not in last ${RECENT_LIMIT})`);
+  res.status(204).send("ignored");
+  return;
+}
+
     const conv = await transformOrder(order);
     remember({
       id: order.id,
