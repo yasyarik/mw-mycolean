@@ -1,3 +1,5 @@
+// scanner_runtime.js (ESM)
+
 const SHOP = process.env.SHOPIFY_SHOP;
 const TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
@@ -15,7 +17,9 @@ function toNum(x) {
 
 async function adminFetch(path) {
   const url = `https://${SHOP}/admin/api/2025-01${path}`;
-  const r = await fetch(url, { headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" } });
+  const r = await fetch(url, {
+    headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" }
+  });
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     throw new Error(`HTTP ${r.status} ${r.statusText} ${t}`);
@@ -166,31 +170,28 @@ function pickRecipeFromMetafields(mfs, knownVariantIds = null) {
   return [];
 }
 
-async function dumpMeta(productId) {
+export async function dumpMeta(productId) {
   const variants = await listProductVariants(productId);
   const knownIds = new Set(variants.map(v => String(v.id)));
   const product_metafields = await listProductMetafields(productId);
-  const product_recipe_guess = pickRecipeFromMetafields(product_metafields, knownIds);
-  const variant_metafields = {};
+  const product_recipe = pickRecipeFromMetafields(product_metafields, knownIds);
   const variant_recipes = {};
   for (const v of variants) {
     const m = await listVariantMetafields(v.id);
-    variant_metafields[v.id] = m;
-    const r = pickRecipeFromMetafields(m, knownIds);
-    variant_recipes[v.id] = r;
+    variant_recipes[v.id] = pickRecipeFromMetafields(m, knownIds);
   }
   return {
     ok: true,
     product_id: String(productId),
-    product_recipe: product_recipe_guess,
+    product_recipe,
     variants: variants.map(v => ({ id: v.id })),
     variant_recipes,
     product_metafields,
-    variant_metafields
+    variant_metafields: undefined
   };
 }
 
-async function buildBundleMap({ onlyProductId = null, onlyVariantId = null } = {}) {
+export async function buildBundleMap({ onlyProductId = null, onlyVariantId = null } = {}) {
   const out = {};
   if (onlyVariantId) {
     const pidRes = await adminFetch(`/variants/${onlyVariantId}.json?fields=product_id`);
@@ -226,17 +227,11 @@ async function buildBundleMap({ onlyProductId = null, onlyVariantId = null } = {
     let found = false;
     const pMfs = await listProductMetafields(p.id);
     const pRec = pickRecipeFromMetafields(pMfs, knownIds);
-    if (pRec.length) {
-      out[`product:${p.id}`] = pRec;
-      found = true;
-    }
+    if (pRec.length) { out[`product:${p.id}`] = pRec; found = true; }
     for (const v of vars) {
       const mfs = await listVariantMetafields(v.id);
       const r = pickRecipeFromMetafields(mfs, knownIds);
-      if (r.length) {
-        out[`variant:${v.id}`] = r;
-        found = true;
-      }
+      if (r.length) { out[`variant:${v.id}`] = r; found = true; }
     }
     if (found) okIds.push(String(p.id)); else missIds.push(String(p.id));
   }
@@ -245,8 +240,3 @@ async function buildBundleMap({ onlyProductId = null, onlyVariantId = null } = {
   out["__stats"] = { total: products.length, ok: okIds.length, miss: missIds.length };
   return out;
 }
-
-module.exports = {
-  dumpMeta,
-  buildBundleMap
-};
