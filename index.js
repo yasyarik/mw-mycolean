@@ -589,7 +589,32 @@ app.use("/shipstation", async (req, res) => {
 });
 
 
-app.get("/health", (req, res) => res.send("OK"));
+app.get("/health", async (req, res) => {
+  try {
+    if (req.query && req.query.dump === "1" && req.query.product_id) {
+      const { dumpMeta } = await import("./scanner_runtime.js");
+      const pid = String(req.query.product_id);
+      const data = await dumpMeta(pid);
+      res.set("Content-Type", "application/json; charset=utf-8");
+      res.status(200).send(JSON.stringify(data, null, 2));
+      return;
+    }
+
+    if (req.query && (req.query.scan === "1" || req.query.scan_bundle_map === "1")) {
+      const { buildBundleMap } = await import("./scanner_runtime.js");
+      const productId = req.query.product_id ? String(req.query.product_id) : null;
+      const variantId = req.query.variant_id ? String(req.query.variant_id) : null;
+      const map = await buildBundleMap({ onlyProductId: productId, onlyVariantId: variantId });
+      res.set("Content-Type", "application/json; charset=utf-8");
+      res.status(200).send(JSON.stringify({ ok: true, keys: Object.keys(map).length, map }, null, 2));
+      return;
+    }
+
+    res.send("ok");
+  } catch (e) {
+    res.status(500).send({ ok: false, error: String(e.message || e) });
+  }
+});
 
 const PORT = process.env.PORT || 8080;
 
