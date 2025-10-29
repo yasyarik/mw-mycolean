@@ -378,6 +378,26 @@ function scheduleSSRefresh(){
     SS_LAST_REFRESH_AT = Date.now();
   }, 5000);
 }
+function mapSSStatus(o) {
+  try {
+    if (o.cancelled_at || (o.cancel_reason && String(o.cancel_reason).length)) return "cancelled";
+
+    const tags = String(o.tags || "").toLowerCase();
+    if (tags.includes("on hold") || tags.includes("hold")) return "on_hold";
+
+    const fs = String(o.financial_status || "").toLowerCase();
+    if (fs && fs !== "paid" && fs !== "partially_paid" && fs !== "partially_refunded" && fs !== "refunded") {
+      return "awaiting_payment";
+    }
+
+    const ff = String(o.fulfillment_status || "").toLowerCase();
+    if (ff === "fulfilled" || ff === "shipped") return "shipped";
+
+    return "awaiting_shipment";
+  } catch (_) {
+    return "awaiting_shipment";
+  }
+}
 
 async function getVariantImage(variantId) {
   if (!variantId) {
@@ -745,7 +765,7 @@ function minimalXML(o) {
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
   const lastMod = fmtShipDate(new Date());
-  const shipStationStatus = "awaiting_shipment";
+ const shipStationStatus = o._ss_status || "awaiting_shipment";
 
   const itemsXml = items.map(i => `
     <Item>
@@ -835,19 +855,22 @@ app.use("/shipstation", async (req, res) => {
       const data = await r.json();
       const order = data.order || data;
       const conv = await transformOrder(order);
-      remember({
-        id: order.id,
-        name: order.name,
-        email: order.email || "",
-        shipping_address: order.shipping_address || {},
-        billing_address: order.billing_address || {},
-        payload: conv,
-        created_at: order.created_at || new Date().toISOString()
-      });
-      statusById.set(order.id, "awaiting_shipment");
-      const xml = minimalXML(bestById.get(String(order.id)));
-      res.status(200).send(xml);
-      return;
+    const shadow = {
+  id: order.id,
+  name: order.name,
+  email: order.email || "",
+  shipping_address: order.shipping_address || {},
+  billing_address: order.billing_address || {},
+  payload: conv,
+  created_at: order.created_at || new Date().toISOString(),
+  _ss_status: mapSSStatus(order) // ← статус берём напрямую из свежего Shopify-ордера
+};
+const xml = minimalXML(shadow);
+res.status(200).send(xml);
+return;
+
+    
+     
     } catch (e) {
       res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Reprocess error</Error>`);
       return;
