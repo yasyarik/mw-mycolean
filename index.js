@@ -360,62 +360,72 @@ async function transformOrder(order) {
   const handled = new Set();
 
   const tags = String(order.tags || "").toLowerCase();
-  const anyBundle = sbDetectFromOrder(order);
-  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
+  const hasBundleTag =
+    tags.includes("simple bundles") ||
+    tags.includes("bundle") ||
+    tags.includes("skio") ||
+    tags.includes("aftersell");
   const sub = isSubscription(order);
 
-  // теперь считаем кандидатом всё, что хоть как-то похоже:
-  if (!anyBundle && !hasBundleTag && !sub) {
+  const sb = sbDetectFromOrder(order);
+
+  // Если совсем ничего не намекает на бандл/подписку — пропускаем
+  if (!sb && !hasBundleTag && !sub) {
     console.log("SKIP ORDER (no bundle/subscription detected):", order.id, order.name);
     return { after: [] };
   }
 
-  // 1) если SB/AfterSell что-то нашли — используем как было
-  const sb = anyBundle;
-  if (sb) {
+  // 1) Если детки найдены детектором (обычно zero/AfterSell) — добавляем их, но НЕ выходим.
+  if (sb && Array.isArray(sb.children) && sb.children.length) {
     for (const c of sb.children) {
       handled.add(c.id);
       const imageUrl = await getVariantImage(c.variant_id);
       pushLine(after, c, imageUrl);
-      console.log("SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
+      console.log("SB CHILD", {
+        id: c.id,
+        title: c.title,
+        variant_id: c.variant_id,
+        imageUrl: imageUrl ? "OK" : "NO"
+      });
     }
-    return { after };
   }
 
-  // 2) ДОБАВЛЕНО: попытаться разложить по рецепту из сканера (вариант/продукт)
-  //    Это работает и для recurring SKIO, где дети не приходят в line_items.
+  // 2) Пытаемся разложить оставшиеся позиции по рецепту из сканера (вариант → продукт).
   let expandedByScanner = false;
-  for (const li of (order.line_items || [])) {
-    try{
+  for (const li of Array.isArray(order.line_items) ? order.line_items : []) {
+    if (handled.has(li.id)) continue;
+
+    try {
       const comps = await fetchBundleRecipe(li.product_id, li.variant_id);
       if (Array.isArray(comps) && comps.length) {
-        // помечаем родителя обработанным, детей кладём с реальными ценами и qty*parentQty
         handled.add(li.id);
+        const parentQty = toNum(li.quantity || 1);
+
         for (const c of comps) {
-          const unit = await fetchVariantPrice(c.variantId);
-          const qty = (toNum(c.qty || c.quantity || 1)) * (toNum(li.quantity || 1));
-          const imageUrl = await getVariantImage(c.variantId);
+          const childVid = String(c.variantId || c.variant_id || "");
+          const unit = await fetchVariantPrice(childVid);        // реальная цена варианта
+          const qty = (toNum(c.qty || c.quantity || 1)) * parentQty;
+          const imageUrl = await getVariantImage(childVid);
+
           after.push({
-            id: `${li.id}::${c.variantId}`,
+            id: `${li.id}::${childVid}`,
             title: li.title,
             sku: li.sku || null,
-            qty: qty,
-            unitPrice: unit,            // реальная цена варианта-ребёнка
+            qty,
+            unitPrice: unit,
             imageUrl: imageUrl || ""
           });
         }
+
         expandedByScanner = true;
       }
-    }catch(e){
+    } catch (e) {
       console.error("scanner expand error:", e);
     }
   }
-  if (expandedByScanner) {
-    return { after };
-  }
 
-  // 3) иначе — как и было раньше: просто прокидываем товары как есть
-  for (const li of (order.line_items || [])) {
+  // 3) Всё, что не обработано — как есть (обычные товары, подарки и т.п.).
+  for (const li of Array.isArray(order.line_items) ? order.line_items : []) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
     after.push({
@@ -430,6 +440,7 @@ async function transformOrder(order) {
 
   return { after };
 }
+
 
 async function handleOrderCreateOrUpdate(req, res) {
   try {
