@@ -885,14 +885,45 @@ return;
   }
 
   const id = req.query.order_id;
-  let order;
   if (id) {
-    order = bestById.get(String(id));
+    try {
+      const shop = process.env.SHOPIFY_SHOP;
+      const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+      if (!shop || !admin) throw new Error("Shopify creds missing");
+
+      const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, {
+        headers: { "X-Shopify-Access-Token": admin }
+      });
+      if (!r.ok) throw new Error(`Shopify fetch failed ${r.status} ${r.statusText}`);
+
+      const data = await r.json();
+      const orderLive = data.order || data;
+      const conv = await transformOrder(orderLive);
+
+      const shadow = {
+        id: orderLive.id,
+        name: orderLive.name,
+        email: orderLive.email || "",
+        shipping_address: orderLive.shipping_address || {},
+        billing_address: orderLive.billing_address || {},
+        payload: conv,
+        created_at: orderLive.created_at || new Date().toISOString(),
+        _ss_status: mapSSStatus(orderLive)
+      };
+
+      res.status(200).send(minimalXML(shadow));
+      return;
+    } catch (_) {
+      const cached = bestById.get(String(id));
+      res.status(200).send(minimalXML(cached || { payload: { after: [] } }));
+      return;
+    }
   } else {
-    order = getLastOrder();
+    const last = getLastOrder();
+    res.status(200).send(minimalXML(last || { payload: { after: [] } }));
+    return;
   }
-  res.send(minimalXML(order || { payload: { after: [] } }));
-});
+
 
 
 app.get("/health", async (req, res) => {
