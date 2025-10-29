@@ -7,6 +7,11 @@ const SB_NS_CANDIDATES = [
   { ns: "simplebundles",      key: "components" },
   { ns: "bundles",            key: "components" }
 ];
+// Product-level overrides: read recipe from another product, but store under the original
+const PRODUCT_RECIPE_OVERRIDES = {
+  "10345847423286": "10353217306934"
+};
+
 
 function toNum(x){ const n=Number(x); return Number.isFinite(n)?n:0; }
 
@@ -201,38 +206,49 @@ export async function buildBundleMap({ onlyProductId=null, onlyVariantId=null } 
     return out;
   }
 
-  if(onlyProductId){
-    const pMfs = await listProductMetafields(onlyProductId);
-    const pRec = pickRecipeFromMetafields(pMfs);
-    if(pRec.length) out[`product:${onlyProductId}`]=pRec;
+if(onlyProductId){
+  const scanProductId = PRODUCT_RECIPE_OVERRIDES[String(onlyProductId)] || onlyProductId;
 
-    const vars = await listProductVariants(onlyProductId);
-    for(const v of vars){
-      const mfs = await listVariantMetafields(v.id);
-      const r = pickRecipeFromMetafields(mfs);
-      if(r.length) out[`variant:${v.id}`]=r;
-    }
-    return out;
+  // читаем МФ у "донорского" продукта (scanProductId), но сохраняем под ключом оригинала
+  const pMfs = await listProductMetafields(scanProductId);
+  const pRec = pickRecipeFromMetafields(pMfs);
+  if(pRec.length) out[`product:${onlyProductId}`]=pRec;
+
+  // варианты читаем у того же "донорского" продукта, но храним как варианты оригинала не нужно.
+  // Для совместимости — просто добавим варианты донора как есть:
+  const vars = await listProductVariants(scanProductId);
+  for(const v of vars){
+    const mfs = await listVariantMetafields(v.id);
+    const r = pickRecipeFromMetafields(mfs);
+    if(r.length) out[`variant:${v.id}`]=r;
   }
+  return out;
+}
+
+
 
   const okIds=[]; const missIds=[];
   const products = await listAllProducts();
-  for(const p of products){
-    let found=false;
+for(const p of products){
+  let found=false;
 
-    const pMfs = await listProductMetafields(p.id);
-    const pRec = pickRecipeFromMetafields(pMfs);
-    if(pRec.length){ out[`product:${p.id}`]=pRec; found=true; }
+  const scanProductId = PRODUCT_RECIPE_OVERRIDES[String(p.id)] || p.id;
 
-    const vars = await listProductVariants(p.id);
-    for(const v of vars){
-      const mfs = await listVariantMetafields(v.id);
-      const r = pickRecipeFromMetafields(mfs);
-      if(r.length){ out[`variant:${v.id}`]=r; found=true; }
-    }
+  // читаем у "донорского" продукта
+  const pMfs = await listProductMetafields(scanProductId);
+  const pRec = pickRecipeFromMetafields(pMfs);
+  if(pRec.length){ out[`product:${p.id}`]=pRec; found=true; }
 
-    if(found) okIds.push(String(p.id)); else missIds.push(String(p.id));
+  const vars = await listProductVariants(scanProductId);
+  for(const v of vars){
+    const mfs = await listVariantMetafields(v.id);
+    const r = pickRecipeFromMetafields(mfs);
+    if(r.length){ out[`variant:${v.id}`]=r; found=true; }
   }
+
+  if(found) okIds.push(String(p.id)); else missIds.push(String(p.id));
+}
+
   out["__REPORT_OK"]=okIds;
   out["__REPORT_MISS"]=missIds;
   out["__stats"]={ total:products.length, ok:okIds.length, miss:missIds.length };
