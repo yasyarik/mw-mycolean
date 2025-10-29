@@ -98,6 +98,18 @@ function anyAfterSellKey(li){
   });
 }
 
+function isUpsellLine(li){
+  const p = Array.isArray(li?.properties) ? li.properties : [];
+  const hasExact = n => p.some(x => String(x.name || "").toLowerCase() === n);
+  const hasPart  = n => p.some(x => String(x.name || "").toLowerCase().includes(n));
+  if (hasExact("_isonetimeupsell")) return true;
+  if (hasExact("_surprisedelightruleid")) return true;
+  if (hasExact("_surprisedelightupsell")) return true;
+  if (hasPart("aftersell")) return true;
+  if (hasPart("post_purchase")) return true;
+  return false;
+}
+
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
@@ -397,9 +409,12 @@ async function transformOrder(order) {
     const tagHint = /simple bundles|bundle|aftersell|upcart|skio/.test(tags);
     const sb = sbDetectFromOrder(order);
 
+    let expanded = false;
+
     if (sb && Array.isArray(sb.children) && sb.children.length) {
       for (const c of sb.children) {
         try {
+          if (isUpsellLine(c)) { handled.add(c.id); continue; }
           handled.add(c.id);
           const variantId = c.variant_id || c.variantId || null;
           const imageUrl = await getVariantImage(variantId);
@@ -413,13 +428,16 @@ async function transformOrder(order) {
             unitPrice: price,
             imageUrl: imageUrl || ""
           });
+          expanded = true;
         } catch (e) {}
       }
-    } else {
-      let expanded = false;
-      const items = Array.isArray(order.line_items) ? order.line_items : [];
+    }
 
+    {
+      const items = Array.isArray(order.line_items) ? order.line_items : [];
       for (const li of items) {
+        if (handled.has(li.id)) continue;
+        if (isUpsellLine(li)) { handled.add(li.id); continue; }
         const likelyParent = hasParentFlag(li) || bundleKey(li) || /bundle/i.test(String(li.title||""));
         if (!likelyParent) continue;
         const recipe = await fetchBundleRecipe(li.product_id, li.variant_id);
@@ -445,28 +463,32 @@ async function transformOrder(order) {
 
       if (!expanded && items.length === 1) {
         const li = items[0];
-        const recipe = await fetchBundleRecipe(li.product_id, li.variant_id);
-        if (Array.isArray(recipe) && recipe.length) {
-          handled.add(li.id);
-          for (const comp of recipe) {
-            const vid = comp.variantId;
-            const price = await fetchVariantPrice(vid);
-            const imageUrl = await getVariantImage(vid);
-            const qty = (Number(comp.qty || 1) || 1) * (Number(li.quantity || 1) || 1);
-            after.push({
-              id: `${li.id}::${vid}`,
-              title: li.title,
-              sku: (li.sku || "").trim() || null,
-              qty,
-              unitPrice: toNum(price),
-              imageUrl: imageUrl || ""
-            });
+        if (!isUpsellLine(li)) {
+          const recipe = await fetchBundleRecipe(li.product_id, li.variant_id);
+          if (Array.isArray(recipe) && recipe.length) {
+            handled.add(li.id);
+            for (const comp of recipe) {
+              const vid = comp.variantId;
+              const price = await fetchVariantPrice(vid);
+              const imageUrl = await getVariantImage(vid);
+              const qty = (Number(comp.qty || 1) || 1) * (Number(li.quantity || 1) || 1);
+              after.push({
+                id: `${li.id}::${vid}`,
+                title: li.title,
+                sku: (li.sku || "").trim() || null,
+                qty,
+                unitPrice: toNum(price),
+                imageUrl: imageUrl || ""
+              });
+            }
+            expanded = true;
           }
-          expanded = true;
+        } else {
+          handled.add(li.id);
         }
       }
 
-      if (!expanded && !tagHint) {
+      if (!expanded && !sb && !tagHint) {
         return { after: [] };
       }
     }
