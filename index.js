@@ -261,13 +261,11 @@ function scheduleSSRefresh(){
 
 async function getVariantImage(variantId) {
   if (!variantId) {
-    console.log("getVariantImage: NO variant_id");
     return "";
   }
   const key = String(variantId);
   if (variantImageCache.has(key)) {
     const cached = variantImageCache.get(key);
-    console.log(`CACHE HIT variant:${variantId} → ${cached || "EMPTY"}`);
     return cached;
   }
 
@@ -275,42 +273,34 @@ async function getVariantImage(variantId) {
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
   if (!shop) {
-    console.log("MISSING SHOPIFY_SHOP in .env");
     variantImageCache.set(key, "");
     return "";
   }
   if (!token) {
-    console.log("MISSING SHOPIFY_ADMIN_ACCESS_TOKEN in .env");
     variantImageCache.set(key, "");
     return "";
   }
 
   const url = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
-  console.log(`FETCHING: ${url}`);
 
   try {
     const res = await fetch(url, {
       headers: { "X-Shopify-Access-Token": token }
     });
 
-    console.log(`API RESPONSE: ${res.status} ${res.statusText}`);
-
     if (!res.ok) {
-      const errText = await res.text();
-      console.log(`API ERROR BODY: ${errText}`);
-      throw new Error(`HTTP ${res.status}`);
+      variantImageCache.set(key, "");
+      return "";
     }
 
     const data = await res.json();
     const variant = data.variant;
     if (!variant) {
-      console.log("NO variant in response");
       variantImageCache.set(key, "");
       return "";
     }
 
     let imageUrl = variant.image?.src || "";
-    console.log(`VARIANT IMAGE: ${imageUrl || "NONE"}`);
 
     if (!imageUrl && variant.product_id) {
       const prodRes = await fetch(
@@ -325,10 +315,77 @@ async function getVariantImage(variantId) {
 
     variantImageCache.set(key, imageUrl);
     return imageUrl;
-  } catch (e) {
-    console.error(`IMAGE FETCH FAILED (variant ${variantId}):`, e.message);
+  } catch (_) {
     variantImageCache.set(key, "");
     return "";
+  }
+}
+
+async function fetchVariantPrice(variantId) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!shop || !token || !variantId) return 0;
+  try {
+    const r = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, {
+      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
+    });
+    if (!r.ok) return 0;
+    const j = await r.json();
+    const price = Number(j?.variant?.price);
+    return Number.isFinite(price) ? price : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function fetchBundleRecipe(productId, variantId) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!shop || !token || !productId) return null;
+
+  const tryKeys = [
+    { ns: "simple_bundles_2_0", key: "components" },
+    { ns: "simple_bundles",     key: "components" },
+    { ns: "simplebundles",      key: "components" },
+    { ns: "bundles",            key: "components" }
+  ];
+
+  const gql = `
+    query($pid: ID!, $ids: [HasMetafieldsIdentifier!]!) {
+      product(id: $pid) {
+        id
+        metafields(identifiers: $ids) { namespace key type value }
+      }
+    }`;
+
+  const identifiers = tryKeys.map(k => ({ namespace: k.ns, key: k.key }));
+
+  try {
+    const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+      method: "POST",
+      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: gql, variables: { pid: `gid://shopify/Product/${productId}`, ids: identifiers } })
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const mfs = j?.data?.product?.metafields || [];
+    const mf = mfs.find(m => m?.value);
+    if (!mf) return null;
+
+    let parsed = null;
+    try { parsed = JSON.parse(mf.value); } catch (_) {}
+    if (!parsed) return null;
+
+    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.components) ? parsed.components : []);
+    const out = [];
+    for (const it of list) {
+      const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//, "");
+      const qty = Number(it.quantity || it.qty || it.qty_each || 0);
+      if (vid && qty > 0) out.push({ variantId: vid, qty });
+    }
+    return out.length ? out : null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -339,10 +396,7 @@ async function transformOrder(order) {
     const tags = String(order?.tags || "").toLowerCase();
     const tagHint = /simple bundles|bundle|aftersell|upcart|skio/.test(tags);
     const sb = sbDetectFromOrder(order);
-    if (!sb && !tagHint) {
-      console.log("SKIP ORDER (no bundle detected):", order?.id, order?.name);
-      return { after: [] };
-    }
+
     if (sb && Array.isArray(sb.children) && sb.children.length) {
       for (const c of sb.children) {
         try {
@@ -359,12 +413,64 @@ async function transformOrder(order) {
             unitPrice: price,
             imageUrl: imageUrl || ""
           });
-        } catch (e) {
-          console.error("CHILD PUSH ERROR:", e);
+        } catch (e) {}
+      }
+    } else {
+      let expanded = false;
+      const items = Array.isArray(order.line_items) ? order.line_items : [];
+
+      for (const li of items) {
+        const likelyParent = hasParentFlag(li) || bundleKey(li) || /bundle/i.test(String(li.title||""));
+        if (!likelyParent) continue;
+        const recipe = await fetchBundleRecipe(li.product_id, li.variant_id);
+        if (Array.isArray(recipe) && recipe.length) {
+          handled.add(li.id);
+          for (const comp of recipe) {
+            const vid = comp.variantId;
+            const price = await fetchVariantPrice(vid);
+            const imageUrl = await getVariantImage(vid);
+            const qty = (Number(comp.qty || 1) || 1) * (Number(li.quantity || 1) || 1);
+            after.push({
+              id: `${li.id}::${vid}`,
+              title: li.title,
+              sku: (li.sku || "").trim() || null,
+              qty,
+              unitPrice: toNum(price),
+              imageUrl: imageUrl || ""
+            });
+          }
+          expanded = true;
         }
       }
-      return { after };
+
+      if (!expanded && items.length === 1) {
+        const li = items[0];
+        const recipe = await fetchBundleRecipe(li.product_id, li.variant_id);
+        if (Array.isArray(recipe) && recipe.length) {
+          handled.add(li.id);
+          for (const comp of recipe) {
+            const vid = comp.variantId;
+            const price = await fetchVariantPrice(vid);
+            const imageUrl = await getVariantImage(vid);
+            const qty = (Number(comp.qty || 1) || 1) * (Number(li.quantity || 1) || 1);
+            after.push({
+              id: `${li.id}::${vid}`,
+              title: li.title,
+              sku: (li.sku || "").trim() || null,
+              qty,
+              unitPrice: toNum(price),
+              imageUrl: imageUrl || ""
+            });
+          }
+          expanded = true;
+        }
+      }
+
+      if (!expanded && !tagHint) {
+        return { after: [] };
+      }
     }
+
     for (const li of (order.line_items || [])) {
       if (handled.has(li.id)) continue;
       try {
@@ -377,13 +483,11 @@ async function transformOrder(order) {
           unitPrice: toNum(li.price),
           imageUrl: imageUrl || ""
         });
-      } catch (e) {
-        console.error("LI PUSH ERROR:", e);
-      }
+      } catch (e) {}
     }
+
     return { after };
-  } catch (err) {
-    console.error("transformOrder fatal:", err);
+  } catch (_) {
     return { after: [] };
   }
 }
