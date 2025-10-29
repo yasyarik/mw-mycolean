@@ -573,58 +573,76 @@ if (!kids.length) {
     if ((hasUpcartSub || hasPlan) && (isBundleSku || isBundleTitle)) ubCandidates.push(li);
   }
 
-  for (const li of ubCandidates) {
-    try {
-      const { buildBundleMap } = await import("./scanner_runtime.js");
+ for (const li of ubCandidates) {
+  try {
+    const { buildBundleMap } = await import("./scanner_runtime.js");
 
-      let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-      let recipe = map[`variant:${li.variant_id}`];
+    // 1) Сначала пробуем по variant
+    let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
+    let recipe = Array.isArray(map?.[`variant:${li.variant_id}`]) ? map[`variant:${li.variant_id}`] : [];
 
-      if (!Array.isArray(recipe) || !recipe.length) {
-        map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-        recipe = map[`product:${li.product_id}`];
-        if (!recipe || !recipe.length) {
-          const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
-          if (vKeys.length === 1) recipe = map[vKeys[0]] || [];
+    // 2) Если пусто — пробуем по product
+    if (!recipe.length) {
+      map = await buildBundleMap({ onlyProductId: String(li.product_id) });
+      recipe = Array.isArray(map?.[`product:${li.product_id}`]) ? map[`product:${li.product_id}`] : [];
+
+      // 2a) Алиас-product fallback (когда scanner кладёт под другой product:id)
+      if (!recipe.length) {
+        const pKeys = Object.keys(map).filter(k => k.startsWith("product:"));
+        if (pKeys.length >= 1) {
+          recipe = Array.isArray(map[pKeys[0]]) ? map[pKeys[0]] : [];
+          console.log(__ORD, "SCANNER FALLBACK alias-product → used", pKeys[0], `(${recipe.length})`);
         }
       }
 
-      if (Array.isArray(recipe) && recipe.length) {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id,
-          found_children: recipe.length
-        });
-        for (const r of recipe) {
-          const vid = String(r.variantId || r.variant_id || r.id || "").trim();
-          const qty = Math.max(1, Number(r.qty || r.quantity || 1));
-          if (!vid) continue;
-
-          const vb = await getVariantBasics(vid);
-          const imageUrl = await getVariantImage(vid);
-
-          after.push({
-            id: `${li.id}:${vid}`,
-            title: vb.title,
-            sku: vb.sku,
-            qty: qty * (li.quantity || 1),
-            unitPrice: vb.price,
-            imageUrl
-          });
+      // 2b) Если у карты оказался только один variant:* — используем его как донор
+      if (!recipe.length) {
+        const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
+        if (vKeys.length === 1) {
+          recipe = Array.isArray(map[vKeys[0]]) ? map[vKeys[0]] : [];
+          console.log(__ORD, "SCANNER FALLBACK donor-variant → used", vKeys[0], `(${recipe.length})`);
         }
-        handled.add(li.id);
-      } else {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id
-        });
       }
-    } catch (e) {
-      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
     }
+
+    if (recipe.length) {
+      console.log(__ORD, "SCANNER EXPAND UB PARENT", {
+        li_id: li.id,
+        product_id: li.product_id,
+        variant_id: li.variant_id,
+        found_children: recipe.length
+      });
+
+      for (const r of recipe) {
+        const vid = String(r.variantId || r.variant_id || r.id || "").trim();
+        const qty = Math.max(1, Number(r.qty || r.quantity || 1));
+        if (!vid) continue;
+
+        const vb = await getVariantBasics(vid);
+        const imageUrl = await getVariantImage(vid);
+
+        after.push({
+          id: `${li.id}:${vid}`,
+          title: vb.title,
+          sku: vb.sku,
+          qty: qty * (li.quantity || 1),
+          unitPrice: vb.price,
+          imageUrl
+        });
+      }
+      handled.add(li.id);
+    } else {
+      console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
+        li_id: li.id,
+        product_id: li.product_id,
+        variant_id: li.variant_id
+      });
+    }
+  } catch (e) {
+    console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
   }
+}
+
 
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
