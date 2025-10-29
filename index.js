@@ -584,20 +584,32 @@ app.use("/shipstation", async (req, res) => {
 
 
 app.get("/health", async (req, res) => {
-  if (req.query && (req.query.scan === "1" || req.query.scan_bundle_map === "1")) {
-    try {
+  try {
+    // 1) диагностический дамп: /health?dump=1&product_id=...
+    if (req.query && req.query.dump === "1" && req.query.product_id) {
+      const { dumpMeta } = await import("./scanner_runtime.js");
+      const pid = String(req.query.product_id);
+      const data = await dumpMeta(pid);
+      res.set("Content-Type","application/json; charset=utf-8");
+      res.status(200).send(JSON.stringify(data, null, 2));
+      return;
+    }
+    // 2) сбор карты: /health?scan=1[&product_id=...]
+    if (req.query && (req.query.scan === "1" || req.query.scan_bundle_map === "1")) {
       const { buildBundleMap } = await import("./scanner_runtime.js");
       const productId = req.query.product_id ? String(req.query.product_id) : null;
       const map = await buildBundleMap({ onlyProductId: productId });
       res.set("Content-Type","application/json; charset=utf-8");
       res.status(200).send(JSON.stringify({ ok:true, keys:Object.keys(map).length, map }, null, 2));
-    } catch (e) {
-      res.status(500).send({ ok:false, error:String(e.message||e) });
+      return;
     }
-    return;
+    // обычный health
+    res.send("ok");
+  } catch (e) {
+    res.status(500).send({ ok:false, error:String(e.message||e) });
   }
-  res.send("ok");
 });
+
 
 
 const PORT = process.env.PORT || 8080;
