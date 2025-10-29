@@ -498,6 +498,21 @@ async function transformOrder(order) {
 
         let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
         let kids = map[`product:${li.product_id}`] || [];
+        if ((!recipe || !recipe.length)) {
+  const pKeys = Object.keys(map).filter(k => k.startsWith("product:"));
+  if (pKeys.length >= 1) {
+    recipe = map[pKeys[0]] || [];
+    console.log(__ORD, "SCANNER FALLBACK alias-product → used", pKeys[0], `(${recipe.length})`);
+  }
+}
+
+if (!kids.length) {
+  const pKeys = Object.keys(map).filter(k => k.startsWith("product:"));
+  if (pKeys.length >= 1) {
+    kids = map[pKeys[0]] || [];
+    console.log(__ORD, "SCANNER FALLBACK alias-product → used", pKeys[0], `(${kids.length})`);
+  }
+}
 
         if (!kids.length) {
           map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
