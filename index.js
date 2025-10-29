@@ -699,16 +699,18 @@ if (!okRecent) {
   return;
 }
 
-    const conv = await transformOrder(order);
-    remember({
-      id: order.id,
-      name: order.name,
-      email: order.email || "",
-      shipping_address: order.shipping_address || {},
-      billing_address: order.billing_address || {},
-      payload: conv,
-      created_at: order.created_at || new Date().toISOString()
-    });
+const conv = await transformOrder(order);
+remember({
+  id: order.id,
+  name: order.name,
+  email: order.email || "",
+  shipping_address: order.shipping_address || {},
+  billing_address: order.billing_address || {},
+  payload: conv,
+  created_at: order.created_at || new Date().toISOString(),
+  _ss_status: mapSSStatus(order)
+});
+
     statusById.set(order.id, "awaiting_shipment");
     if (isMWOrder(order, conv)) {
   scheduleSSRefresh();
