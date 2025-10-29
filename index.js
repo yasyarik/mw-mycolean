@@ -305,6 +305,22 @@ function getLastOrder() {
 }
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
+async function isInLast10Orders(orderId) {
+  try {
+    const shop = process.env.SHOPIFY_SHOP;
+    const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+    if (!shop || !token) return true;
+    const res = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=10&status=any&order=created_at%20desc&fields=id`, {
+      headers: { "X-Shopify-Access-Token": token }
+    });
+    if (!res.ok) return true;
+    const data = await res.json();
+    const ids = (data.orders || []).map(o => String(o.id));
+    return ids.includes(String(orderId));
+  } catch (_) {
+    return true;
+  }
+}
 
 function isMWOrder(order, conv){
   try {
@@ -637,6 +653,13 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
+  const okRecent = await isInLast10Orders(order.id);
+if (!okRecent) {
+  console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
+  res.status(200).send("ok");
+  return;
+}
+
     const conv = await transformOrder(order);
     remember({
       id: order.id,
