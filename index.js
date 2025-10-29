@@ -118,6 +118,41 @@ function detectSubBundleNoChildren(order){
   if (parents.length === 1 && tagStr.includes("simple bundles")) return parents[0];
   return null;
 }
+function looksLikeBundle(li) {
+  const t = (li.title || "").toLowerCase();
+  const s = (li.sku || "").toLowerCase();
+  if (t.includes("bundle") || t.includes("pack") || s.includes("bundle") || s.includes("pack")) return true;
+  const props = Array.isArray(li.properties) ? li.properties : [];
+  return props.some(p => String(p?.name || "").toLowerCase().includes("subscription"));
+}
+
+function hasSubUpgradeProp(li) {
+  const props = Array.isArray(li.properties) ? li.properties : [];
+  return props.some(p => String(p?.name || "").toLowerCase().includes("__upcartsubscriptionupgrade"));
+}
+
+function detectSubBundleParentOnly(order) {
+  // Детектируем только если sbDetect не нашёл детей
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  if (!items.length) return [];
+
+  const tags = String(order?.tags || "").toLowerCase();
+  const isSubscriptionOrder = tags.includes("subscription");
+
+  const out = [];
+  for (const li of items) {
+    const subFlag = isSubscriptionOrder || hasSubUpgradeProp(li) || li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id;
+    if (!subFlag) continue;
+    if (!looksLikeBundle(li)) continue;
+    out.push({
+      id: li.id,
+      title: li.title || "",
+      sku: li.sku || null,
+      variant_id: li.variant_id || null
+    });
+  }
+  return out;
+}
 
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
@@ -396,6 +431,13 @@ if (subBundleParent) {
   }
 
   const sb = sbDetectFromOrder(order);
+  const parentsOnly = detectSubBundleParentOnly(order);
+if (!sb && parentsOnly.length) {
+  for (const p of parentsOnly) {
+    console.log("SUB-BUNDLE NO CHILDREN", p);
+  }
+}
+
   if (sb) {
     for (const c of sb.children) {
       handled.add(c.id);
