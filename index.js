@@ -543,6 +543,10 @@ async function transformOrder(order) {
           imageUrl: imageUrl ? "OK" : "NO"
         });
       }
+      for (const li of (order.line_items || [])) {
+  if (looksLikeBundle(li)) handled.add(li.id);
+}
+
     }
 
  const subParents = __HAS_SB_CHILDREN__ ? [] : (Array.isArray(sb.subBundleParents) ? sb.subBundleParents : []);
@@ -600,7 +604,7 @@ async function transformOrder(order) {
       }
     }
 
-    if (after.length) return { after };
+   
   }
 
   const ubCandidates = [];
