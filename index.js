@@ -476,24 +476,79 @@ console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: subBundleParent.id, title: su
     return { after: [] };
   }
 
-  const sb = sbDetectFromOrder(order);
-  const parentsOnly = detectSubBundleParentOnly(order);
+const sb = sbDetectFromOrder(order);
+const parentsOnly = detectSubBundleParentOnly(order);
 if (!sb && parentsOnly.length) {
   for (const p of parentsOnly) {
-    console.log(__ORD, "SUB-BUNDLE NO CHILDREN", p);
+    console.log(`[ORDER ${order.id} ${order.name || ''}] SUB-BUNDLE NO CHILDREN`, p);
   }
 }
 
-  if (sb) {
+if (sb) {
+  if (Array.isArray(sb.children)) {
     for (const c of sb.children) {
       handled.add(c.id);
       const imageUrl = await getVariantImage(c.variant_id);
       pushLine(after, c, imageUrl);
-     console.log(`[ORDER ${order.id} ${order.name || ''}]`, "SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
-
+      console.log(`[ORDER ${order.id} ${order.name || ''}] SB CHILD`, { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
     }
-    return { after };
   }
+
+  const subParents = Array.isArray(sb.subBundleParents) ? sb.subBundleParents : [];
+  for (const li of subParents) {
+    try {
+      const { buildBundleMap } = await import("./scanner_runtime.js");
+
+      // 1) по продукту
+      let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
+      let kids = map[`product:${li.product_id}`] || [];
+
+      // 2) по варианту
+      if (!kids.length) {
+        map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
+        kids = map[`variant:${li.variant_id}`] || [];
+        // 2a) донор-варик (единственный ключ variant:*)
+        if (!kids.length) {
+          const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
+          if (vKeys.length === 1) kids = map[vKeys[0]] || [];
+        }
+      }
+
+      if (kids.length) {
+        console.log(`[ORDER ${order.id} ${order.name || ''}] SCANNER EXPAND SUB PARENT`, {
+          li_id: li.id, product_id: li.product_id, variant_id: li.variant_id, found_children: kids.length
+        });
+
+        for (const ch of kids) {
+          const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
+          const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
+          if (!vid) continue;
+
+          const vb = await getVariantBasics(vid);
+          const imageUrl = await getVariantImage(vid);
+
+          after.push({
+            id: `${li.id}:${vid}`,
+            title: vb.title,
+            sku: vb.sku,
+            qty: qty * (li.quantity || 1),
+            unitPrice: vb.price,
+            imageUrl
+          });
+        }
+      } else {
+        console.log(`[ORDER ${order.id} ${order.name || ''}] SCANNER EXPAND SUB PARENT — NO KIDS`, {
+          li_id: li.id, product_id: li.product_id, variant_id: li.variant_id
+        });
+      }
+    } catch (e) {
+      console.log(`[ORDER ${order.id} ${order.name || ''}] SCANNER EXPAND ERROR`, String(e && e.message || e));
+    }
+  }
+
+  return { after };
+}
+
   // STEP 2: resolve children from product/variant metafields (dry-run: logs only)
   const ubCandidates = [];
   for (const li of (order.line_items || [])) {
