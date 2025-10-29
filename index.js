@@ -463,11 +463,27 @@ async function getVariantBasics(variantId) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const { variant } = await res.json();
-    return {
-      title: variant?.title || `Variant ${variantId}`,
-      sku: (variant?.sku || "").trim() || null,
-      price: toNum(variant?.price)
-    };
+ let vTitle = variant?.title || `Variant ${variantId}`;
+let vSKU = (variant?.sku || "").trim() || null;
+let vPrice = toNum(variant?.price);
+
+// Фолбэк: если вариант называется "Default Title" и есть product_id — подтянем название продукта
+if ((vTitle || "").toLowerCase() === "default title" && variant?.product_id) {
+  try {
+    const shop = process.env.SHOPIFY_SHOP;
+    const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+    const pr = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=title`, {
+      headers: { "X-Shopify-Access-Token": token }
+    });
+    if (pr.ok) {
+      const pj = await pr.json();
+      if (pj?.product?.title) vTitle = pj.product.title;
+    }
+  } catch (_) {}
+}
+
+return { title: vTitle, sku: vSKU, price: vPrice };
+
   } catch {
     return { title: `Variant ${variantId}`, sku: null, price: 0 };
   }
@@ -493,6 +509,8 @@ async function transformOrder(order) {
   }
 
   if (sb) {
+    const __HAS_SB_CHILDREN__ = Array.isArray(sb.children) && sb.children.length > 0;
+
     if (Array.isArray(sb.children)) {
       for (const c of sb.children) {
         handled.add(c.id);
@@ -507,7 +525,8 @@ async function transformOrder(order) {
       }
     }
 
-    const subParents = Array.isArray(sb.subBundleParents) ? sb.subBundleParents : [];
+ const subParents = __HAS_SB_CHILDREN__ ? [] : (Array.isArray(sb.subBundleParents) ? sb.subBundleParents : []);
+
     for (const li of subParents) {
       try {
         const { buildBundleMap } = await import("./scanner_runtime.js");
