@@ -350,7 +350,7 @@ async function fetchVariantPrice(variantId) {
   }
 }
 
-async function fetchBundleRecipe(productId, variantId) {
+async function fetchBundleRecipe(productId) {
   const shop = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
   if (!shop || !token || !productId) return null;
@@ -401,6 +401,97 @@ async function fetchBundleRecipe(productId, variantId) {
   }
 }
 
+async function fetchVariantRecipe(variantId) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!shop || !token || !variantId) return null;
+
+  const tryKeys = [
+    { ns: "simple_bundles_2_0", key: "components" },
+    { ns: "simple_bundles",     key: "components" },
+    { ns: "simplebundles",      key: "components" },
+    { ns: "bundles",            key: "components" }
+  ];
+
+  const gql = `
+    query($vid: ID!, $ids: [HasMetafieldsIdentifier!]!) {
+      productVariant(id: $vid) {
+        id
+        metafields(identifiers: $ids) { namespace key type value }
+      }
+    }`;
+
+  const identifiers = tryKeys.map(k => ({ namespace: k.ns, key: k.key }));
+
+  try {
+    const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+      method: "POST",
+      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: gql, variables: { vid: `gid://shopify/ProductVariant/${variantId}`, ids: identifiers } })
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const mfs = j?.data?.productVariant?.metafields || [];
+    const mf = mfs.find(m => m?.value);
+    if (!mf) return null;
+
+    let parsed = null;
+    try { parsed = JSON.parse(mf.value); } catch (_) {}
+    if (!parsed) return null;
+
+    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.components) ? parsed.components : []);
+    const out = [];
+    for (const it of list) {
+      const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//, "");
+      const qty = Number(it.quantity || it.qty || it.qty_each || 0);
+      if (vid && qty > 0) out.push({ variantId: vid, qty });
+    }
+    return out.length ? out : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function parseSbComponents(li) {
+  const props = Array.isArray(li?.properties) ? li.properties : [];
+  const rawVals = props
+    .filter(p =>
+      ["_sb_bundle_variant_id_qty", "_sb_components", "_sb_child_id_qty"].includes(p.name)
+    )
+    .map(p => String(p.value))
+    .filter(Boolean);
+  const out = [];
+  for (const v of rawVals) {
+    const s = v.trim();
+    if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
+      try {
+        const parsed = JSON.parse(s);
+        const arr = Array.isArray(parsed) ? parsed : [parsed];
+        for (const it of arr) {
+          const vid = String(it.variant_id || it.variantId || "").replace(/^gid:\/\/shopify\/ProductVariant\//, "");
+          const qty = Number(it.qty || it.quantity || it.qty_each || it.count || 0);
+          if (vid && qty > 0) out.push({ variantId: vid, qty });
+        }
+      } catch (_) {}
+    }
+  }
+  const flat = rawVals.join("|");
+  if (flat) {
+    const parts = flat.split(/[,;|]/).map(x => x.trim()).filter(Boolean);
+    for (const p of parts) {
+      const m = p.match(/^(?:gid:\/\/shopify\/ProductVariant\/)?(\d+)\s*:\s*(\d+)$/i);
+      if (m) out.push({ variantId: m[1], qty: Number(m[2]) || 0 });
+    }
+  }
+  const dedup = new Map();
+  for (const r of out) {
+    if (!r.variantId || r.qty <= 0) continue;
+    const k = r.variantId;
+    dedup.set(k, (dedup.get(k) || 0) + r.qty);
+  }
+  return [...dedup.entries()].map(([variantId, qty]) => ({ variantId, qty }));
+}
+
 async function transformOrder(order) {
   try {
     const after = [];
@@ -429,7 +520,7 @@ async function transformOrder(order) {
             imageUrl: imageUrl || ""
           });
           expanded = true;
-        } catch (e) {}
+        } catch (_) {}
       }
     }
 
@@ -440,7 +531,16 @@ async function transformOrder(order) {
         if (isUpsellLine(li)) { handled.add(li.id); continue; }
         const likelyParent = hasParentFlag(li) || bundleKey(li) || /bundle/i.test(String(li.title||""));
         if (!likelyParent) continue;
-        const recipe = await fetchBundleRecipe(li.product_id, li.variant_id);
+
+        let recipe = await fetchBundleRecipe(li.product_id);
+        if (!recipe || !recipe.length) {
+          recipe = await fetchVariantRecipe(li.variant_id);
+        }
+        if (!recipe || !recipe.length) {
+          const parsed = parseSbComponents(li);
+          if (parsed && parsed.length) recipe = parsed;
+        }
+
         if (Array.isArray(recipe) && recipe.length) {
           handled.add(li.id);
           for (const comp of recipe) {
@@ -464,7 +564,14 @@ async function transformOrder(order) {
       if (!expanded && items.length === 1) {
         const li = items[0];
         if (!isUpsellLine(li)) {
-          const recipe = await fetchBundleRecipe(li.product_id, li.variant_id);
+          let recipe = await fetchBundleRecipe(li.product_id);
+          if (!recipe || !recipe.length) {
+            recipe = await fetchVariantRecipe(li.variant_id);
+          }
+          if (!recipe || !recipe.length) {
+            const parsed = parseSbComponents(li);
+            if (parsed && parsed.length) recipe = parsed;
+          }
           if (Array.isArray(recipe) && recipe.length) {
             handled.add(li.id);
             for (const comp of recipe) {
@@ -482,6 +589,8 @@ async function transformOrder(order) {
               });
             }
             expanded = true;
+          } else {
+            handled.add(li.id);
           }
         } else {
           handled.add(li.id);
@@ -505,7 +614,7 @@ async function transformOrder(order) {
           unitPrice: toNum(li.price),
           imageUrl: imageUrl || ""
         });
-      } catch (e) {}
+      } catch (_) {}
     }
 
     return { after };
@@ -585,7 +694,7 @@ function minimalXML(o) {
   const ship = filledAddress(o.shipping_address || o.billing_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
-  const lastMod = fmtShipDate(new Date());
+  const lastMod = fmtShipDate(new Date()));
   const shipStationStatus = "awaiting_shipment";
 
   const itemsXml = items.map(i => `
