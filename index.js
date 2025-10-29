@@ -4,6 +4,9 @@ import getRawBody from "raw-body";
 import crypto from "crypto";
 
 dotenv.config();
+process.on('unhandledRejection', (err) => { console.error('UNHANDLED REJECTION:', err); });
+process.on('uncaughtException', (err) => { console.error('UNCAUGHT EXCEPTION:', err); });
+
 const app = express();
 
 function hmacOk(raw, header, secret) {
@@ -95,28 +98,21 @@ function anyAfterSellKey(li){
   });
 }
 
-// === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
 
-  const json = JSON.stringify(order).toLowerCase();
-
-  // --- AfterSell / UpCart detection ---
   for (const li of items) {
     const props = Array.isArray(li.properties) ? li.properties : [];
     if (!props.length) continue;
-
     const prop = props.find(p => {
       const n = String(p.name || "").toLowerCase();
       return n.includes("aftersell") || n.includes("upcart");
     });
     if (!prop) continue;
-
     try {
       const raw = prop.value;
       if (typeof raw !== "string" || !raw.includes("{")) continue;
-
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length) {
         const children = parsed.map(c => ({
@@ -127,15 +123,11 @@ function sbDetectFromOrder(order) {
           price: toNum(c.price || 0),
           variant_id: c.variant_id || c.id || null
         }));
-        console.log(`AfterSell/UpCart bundle detected: ${children.length} children`);
         return { children };
       }
-    } catch (e) {
-      console.log("AfterSell/UpCart parse error:", e.message);
-    }
+    } catch (_) {}
   }
 
-  // --- Simple Bundles / Skio detection ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -207,8 +199,11 @@ function remember(e) {
 }
 
 function getLastOrder() {
-  return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
+  if (history.length) return history[history.length - 1];
+  const arr = Array.from(bestById.values());
+  return arr.length ? arr[arr.length - 1] : null;
 }
+
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
 
@@ -217,10 +212,8 @@ function isMWOrder(order, conv){
     const items = Array.isArray(order?.line_items) ? order.line_items : [];
     const origCount = items.length;
     if (conv && Array.isArray(conv.after) && conv.after.length !== origCount) return true;
-
     const tags = String(order?.tags || "").toLowerCase();
     if (tags.includes("simple bundles")) return true;
-
     const epsilon = 0.00001;
     const zeroed = (li) => {
       const da = Array.isArray(li.discount_allocations)
@@ -228,16 +221,13 @@ function isMWOrder(order, conv){
         : 0;
       return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
     };
-
     for (const li of items) {
       if (li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id) return true;
-
       const props = Array.isArray(li.properties) ? li.properties : [];
       if (props.some(p => {
         const n = String(p?.name || "").toLowerCase();
         return n.includes("_sb_") || n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
       })) return true;
-
       if (zeroed(li)) return true;
     }
   } catch (_) {}
@@ -323,7 +313,6 @@ async function getVariantImage(variantId) {
     console.log(`VARIANT IMAGE: ${imageUrl || "NONE"}`);
 
     if (!imageUrl && variant.product_id) {
-      console.log(`FALLBACK: fetching product ${variant.product_id}`);
       const prodRes = await fetch(
         `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`,
         { headers: { "X-Shopify-Access-Token": token } }
@@ -331,7 +320,6 @@ async function getVariantImage(variantId) {
       if (prodRes.ok) {
         const p = await prodRes.json();
         imageUrl = p.product.images?.[0]?.src || "";
-        console.log(`PRODUCT IMAGE: ${imageUrl || "NONE"}`);
       }
     }
 
@@ -345,42 +333,59 @@ async function getVariantImage(variantId) {
 }
 
 async function transformOrder(order) {
-  const after = [];
-  const handled = new Set();
-  const tags = String(order.tags || "").toLowerCase();
-  const anyBundle = sbDetectFromOrder(order);
-  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
-
-  if (!anyBundle && !hasBundleTag) {
-    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
-    return { after: [] };
-  }
-
-  const sb = sbDetectFromOrder(order);
-  if (sb) {
-    for (const c of sb.children) {
-      handled.add(c.id);
-      const imageUrl = await getVariantImage(c.variant_id);
-      pushLine(after, c, imageUrl);
-      console.log("SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
+  try {
+    const after = [];
+    const handled = new Set();
+    const tags = String(order?.tags || "").toLowerCase();
+    const tagHint = /simple bundles|bundle|aftersell|upcart|skio/.test(tags);
+    const sb = sbDetectFromOrder(order);
+    if (!sb && !tagHint) {
+      console.log("SKIP ORDER (no bundle detected):", order?.id, order?.name);
+      return { after: [] };
+    }
+    if (sb && Array.isArray(sb.children) && sb.children.length) {
+      for (const c of sb.children) {
+        try {
+          handled.add(c.id);
+          const variantId = c.variant_id || c.variantId || null;
+          const imageUrl = await getVariantImage(variantId);
+          const price = toNum(c.price ?? c.unitPrice ?? 0);
+          const qty = toNum(c.quantity ?? c.qty ?? 1);
+          after.push({
+            id: c.id,
+            title: c.title ?? c.name ?? "",
+            sku: (c.sku ?? "").trim() || null,
+            qty,
+            unitPrice: price,
+            imageUrl: imageUrl || ""
+          });
+        } catch (e) {
+          console.error("CHILD PUSH ERROR:", e);
+        }
+      }
+      return { after };
+    }
+    for (const li of (order.line_items || [])) {
+      if (handled.has(li.id)) continue;
+      try {
+        const imageUrl = await getVariantImage(li.variant_id);
+        after.push({
+          id: li.id,
+          title: li.title,
+          sku: (li.sku || "").trim() || null,
+          qty: toNum(li.quantity || 1),
+          unitPrice: toNum(li.price),
+          imageUrl: imageUrl || ""
+        });
+      } catch (e) {
+        console.error("LI PUSH ERROR:", e);
+      }
     }
     return { after };
+  } catch (err) {
+    console.error("transformOrder fatal:", err);
+    return { after: [] };
   }
-
-  for (const li of (order.line_items || [])) {
-    if (handled.has(li.id)) continue;
-    const imageUrl = await getVariantImage(li.variant_id);
-    after.push({
-      id: li.id,
-      title: li.title,
-      sku: li.sku || null,
-      qty: li.quantity || 1,
-      unitPrice: toNum(li.price),
-      imageUrl
-    });
-  }
-
-  return { after };
 }
 
 async function handleOrderCreateOrUpdate(req, res) {
@@ -404,12 +409,9 @@ async function handleOrderCreateOrUpdate(req, res) {
     });
     statusById.set(order.id, "awaiting_shipment");
     if (isMWOrder(order, conv)) {
-  scheduleSSRefresh();
-}
-
+      scheduleSSRefresh();
+    }
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
-
-
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -475,7 +477,7 @@ function minimalXML(o) {
 <Orders>
   <Order>
     <OrderID>${esc(o.id)}</OrderID>
-    <OrderNumber>${esc(o.name.replace(/^#/, ''))}</OrderNumber>
+    <OrderNumber>${esc(String(o.name || o.id || '').replace(/^#/, ''))}</OrderNumber>
     <OrderDate>${orderDate}</OrderDate>
     <OrderStatus>${shipStationStatus}</OrderStatus>
     <LastModified>${lastMod}</LastModified>
@@ -561,7 +563,7 @@ app.use("/shipstation", async (req, res) => {
       const xml = minimalXML(bestById.get(String(order.id)));
       res.status(200).send(xml);
       return;
-    } catch (e) {
+    } catch (_) {
       res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Reprocess error</Error>`);
       return;
     }
@@ -582,16 +584,9 @@ app.use("/shipstation", async (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-
 app.get("/health", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 8080;
-
-
- 
-
-
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
