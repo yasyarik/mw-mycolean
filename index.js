@@ -305,37 +305,6 @@ function getLastOrder() {
 }
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
-async function replayLatestFromShopify(limit = 10) {
-  const shop = process.env.SHOPIFY_SHOP;
-  const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if (!shop || !admin) return { ok: false, reason: "no_creds" };
-  try {
-    const n = Math.max(1, Math.min(50, Number(limit) || 10));
-    const r = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=${n}&status=any&order=created_at%20desc`, {
-      headers: { "X-Shopify-Access-Token": admin }
-    });
-    if (!r.ok) return { ok: false, reason: `http_${r.status}` };
-    const data = await r.json();
-    const list = Array.isArray(data.orders) ? data.orders : [];
-    for (const order of list) {
-      const conv = await transformOrder(order);
-      remember({
-        id: order.id,
-        name: order.name,
-        email: order.email || "",
-        shipping_address: order.shipping_address || {},
-        billing_address: order.billing_address || {},
-        payload: conv,
-        created_at: order.created_at || new Date().toISOString()
-      });
-      statusById.set(order.id, "awaiting_shipment");
-    }
-    await ssRefreshNow();
-    return { ok: true, replayed: list.length };
-  } catch (e) {
-    return { ok: false, reason: String(e && e.message || e) };
-  }
-}
 
 function isMWOrder(order, conv){
   try {
@@ -489,43 +458,96 @@ async function getVariantBasics(variantId) {
 }
 
 async function transformOrder(order) {
-  const __ORD = `[ORDER ${order.id} ${order.name || ''}]`;
-
   const after = [];
   const handled = new Set();
   const tags = String(order.tags || "").toLowerCase();
-  const anyBundle = sbDetectFromOrder(order);
-  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
-const subBundleParent = detectSubBundleNoChildren(order);
-if (subBundleParent) {
-console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: subBundleParent.id, title: subBundleParent.title, sku: subBundleParent.sku || null, variant_id: subBundleParent.variant_id || null });
+  const __ORD = `[ORDER ${order.id} ${order.name || ""}]`;
 
-}
+  const hasBundleTag =
+    tags.includes("simple bundles") ||
+    tags.includes("bundle") ||
+    tags.includes("skio") ||
+    tags.includes("aftersell");
 
-  if (!anyBundle && !hasBundleTag) {
-    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
+  const sb = sbDetectFromOrder(order);
+
+  if (!sb && !hasBundleTag) {
+    console.log(__ORD, "SKIP ORDER (no bundle detected)");
     return { after: [] };
   }
 
-  const sb = sbDetectFromOrder(order);
-  const parentsOnly = detectSubBundleParentOnly(order);
-if (!sb && parentsOnly.length) {
-  for (const p of parentsOnly) {
-    console.log(__ORD, "SUB-BUNDLE NO CHILDREN", p);
-  }
-}
-
   if (sb) {
-    for (const c of sb.children) {
-      handled.add(c.id);
-      const imageUrl = await getVariantImage(c.variant_id);
-      pushLine(after, c, imageUrl);
-     console.log(`[ORDER ${order.id} ${order.name || ''}]`, "SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
-
+    if (Array.isArray(sb.children)) {
+      for (const c of sb.children) {
+        handled.add(c.id);
+        const imageUrl = await getVariantImage(c.variant_id);
+        pushLine(after, c, imageUrl);
+        console.log(__ORD, "SB CHILD", {
+          id: c.id,
+          title: c.title,
+          variant_id: c.variant_id,
+          imageUrl: imageUrl ? "OK" : "NO"
+        });
+      }
     }
-    return { after };
+
+    const subParents = Array.isArray(sb.subBundleParents) ? sb.subBundleParents : [];
+    for (const li of subParents) {
+      try {
+        const { buildBundleMap } = await import("./scanner_runtime.js");
+
+        let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
+        let kids = map[`product:${li.product_id}`] || [];
+
+        if (!kids.length) {
+          map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
+          kids = map[`variant:${li.variant_id}`] || [];
+          if (!kids.length) {
+            const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
+            if (vKeys.length === 1) kids = map[vKeys[0]] || [];
+          }
+        }
+
+        if (kids.length) {
+          console.log(__ORD, "SCANNER EXPAND SUB PARENT", {
+            li_id: li.id,
+            product_id: li.product_id,
+            variant_id: li.variant_id,
+            found_children: kids.length
+          });
+
+          for (const ch of kids) {
+            const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
+            const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
+            if (!vid) continue;
+
+            const vb = await getVariantBasics(vid);
+            const imageUrl = await getVariantImage(vid);
+
+            after.push({
+              id: `${li.id}:${vid}`,
+              title: vb.title,
+              sku: vb.sku,
+              qty: qty * (li.quantity || 1),
+              unitPrice: vb.price,
+              imageUrl
+            });
+          }
+        } else {
+          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS", {
+            li_id: li.id,
+            product_id: li.product_id,
+            variant_id: li.variant_id
+          });
+        }
+      } catch (e) {
+        console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
+      }
+    }
+
+    if (after.length) return { after };
   }
-  // STEP 2: resolve children from product/variant metafields (dry-run: logs only)
+
   const ubCandidates = [];
   for (const li of (order.line_items || [])) {
     const props = Array.isArray(li.properties) ? li.properties : [];
@@ -541,85 +563,27 @@ if (!sb && parentsOnly.length) {
       const { buildBundleMap } = await import("./scanner_runtime.js");
 
       let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-      let recipe = map && map[`variant:${li.variant_id}`];
+      let recipe = map[`variant:${li.variant_id}`];
 
       if (!Array.isArray(recipe) || !recipe.length) {
         map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-        recipe = map && map[`product:${li.product_id}`];
+        recipe = map[`product:${li.product_id}`];
+        if (!recipe || !recipe.length) {
+          const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
+          if (vKeys.length === 1) recipe = map[vKeys[0]] || [];
+        }
       }
 
       if (Array.isArray(recipe) && recipe.length) {
-        console.log("META-CHILDREN FOUND", {
-          parent_line_id: li.id,
-          parent_variant_id: li.variant_id,
-          parent_product_id: li.product_id,
-          count: recipe.length
-        });
-        for (const r of recipe) {
-          console.log("META-CHILD", {
-            parent_line_id: li.id,
-            variant_id: r.variantId,
-            qty: r.qty
-          });
-        }
-      } else {
-        console.log("META-CHILDREN NOT FOUND", {
-          parent_line_id: li.id,
-          parent_variant_id: li.variant_id,
-          parent_product_id: li.product_id
-        });
-      }
-    } catch (e) {
-      console.log("META-LOOKUP ERROR", { parent_line_id: li.id, error: String(e?.message || e) });
-    }
-  }
-
-for (const li of (order.line_items || [])) {
-  if (handled.has(li.id)) continue;
-
-  const props = Array.isArray(li.properties) ? li.properties : [];
-  const looksBundle =
-    /bundle/i.test(li.title || "") ||
-    /bundle/i.test(li.sku || "") ||
-    tags.includes("bundle") ||
-    tags.includes("simple bundles");
-
-  const isSubscription =
-    !!(li.selling_plan_id || li.selling_plan_allocation?.selling_plan_id) ||
-    tags.includes("subscription");
-
-  const hasExplicitChildrenInProps = props.some(p => {
-    const n = String(p?.name || "").toLowerCase();
-    return n.includes("children") || n.includes("components") || n.includes("variant_id");
-  });
-
-  let expanded = false;
-
-  if (looksBundle && !hasExplicitChildrenInProps) {
-    try {
-      const { buildBundleMap } = await import("./scanner_runtime.js");
-
-      // 1) Пробуем по продукту
-      let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-      let kids = map[`product:${li.product_id}`] || [];
-
-      // 2) Если пусто — пробуем по варианту
-      if (!kids.length) {
-        map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-        kids = map[`variant:${li.variant_id}`] || [];
-      }
-
-      if (kids.length) {
-        console.log(`[ORDER ${order.id} ${order.name}] SCANNER EXPAND ${isSubscription ? "SUB" : "UB"} NO CHILDREN`, {
+        console.log(__ORD, "SCANNER EXPAND UB PARENT", {
           li_id: li.id,
           product_id: li.product_id,
           variant_id: li.variant_id,
-          found_children: kids.length
+          found_children: recipe.length
         });
-
-        for (const ch of kids) {
-          const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
-          const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
+        for (const r of recipe) {
+          const vid = String(r.variantId || r.variant_id || r.id || "").trim();
+          const qty = Math.max(1, Number(r.qty || r.quantity || 1));
           if (!vid) continue;
 
           const vb = await getVariantBasics(vid);
@@ -630,20 +594,25 @@ for (const li of (order.line_items || [])) {
             title: vb.title,
             sku: vb.sku,
             qty: qty * (li.quantity || 1),
-            unitPrice: vb.price,       // цена ребёнка — реальная, не делим
+            unitPrice: vb.price,
             imageUrl
           });
         }
-        expanded = true;
-        continue; // родителя не добавляем
+        handled.add(li.id);
+      } else {
+        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
+          li_id: li.id,
+          product_id: li.product_id,
+          variant_id: li.variant_id
+        });
       }
     } catch (e) {
-      console.log(`[ORDER ${order.id} ${order.name}] SCANNER EXPAND ERROR`, String(e && e.message || e));
+      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
     }
   }
 
-  // Фоллбэк: если не развернули — пихаем как есть
-  if (!expanded) {
+  for (const li of (order.line_items || [])) {
+    if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
     after.push({
       id: li.id,
@@ -654,11 +623,10 @@ for (const li of (order.line_items || [])) {
       imageUrl
     });
   }
-}
-
 
   return { after };
 }
+
 
 async function handleOrderCreateOrUpdate(req, res) {
   try {
@@ -669,22 +637,6 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
-    // различаем create vs update по пути
-const isUpdateWebhook = req.path && req.path.indexOf("/webhooks/orders-updated") !== -1;
-const isCreateWebhook = req.path && req.path.indexOf("/webhooks/orders-create") !== -1;
-
-// для CREATE — помечаем как «свежий» (входит в окно последних N)
-if (isCreateWebhook) {
-  touchRecent(order);
-}
-
-// для UPDATE — обрабатываем только если этот заказ уже в окне последних
-if (isUpdateWebhook && !isOrderRecent(order.id)) {
-  console.log(`[ORDER ${order.id} ${order.name || ''}] SKIP UPDATE (not in last ${RECENT_LIMIT})`);
-  res.status(204).send("ignored");
-  return;
-}
-
     const conv = await transformOrder(order);
     remember({
       id: order.id,
@@ -896,13 +848,6 @@ app.get("/health", async (req, res) => {
       res.status(200).send(JSON.stringify({ ok: true, keys: Object.keys(map).length, map }, null, 2));
       return;
     }
-    if (req.query && req.query.replay_latest) {
-      const n = Math.max(1, Math.min(50, Number(req.query.replay_latest) || 10));
-      const out = await replayLatestFromShopify(n);
-      res.set("Content-Type", "application/json; charset=utf-8");
-      res.status(200).send(JSON.stringify({ ok: true, ...out }, null, 2));
-      return;
-    }
 
     res.send("ok");
   } catch (e) {
@@ -918,12 +863,4 @@ const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-    const REPLAY_INTERVAL_MS = Number(process.env.REPLAY_INTERVAL_MS || 30000);
-  const REPLAY_TAIL = Number(process.env.REPLAY_TAIL || 10);
-  if (REPLAY_INTERVAL_MS > 0) {
-    setInterval(() => {
-      replayLatestFromShopify(REPLAY_TAIL).catch(() => {});
-    }, REPLAY_INTERVAL_MS);
-  }
-
 });
