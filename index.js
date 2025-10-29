@@ -160,6 +160,17 @@ function sbDetectFromOrder(order) {
   if (!items.length) return null;
 
   const json = JSON.stringify(order).toLowerCase();
+  // Pre-calc: subscription bundle parents without children
+  const subBundleParents = (Array.isArray(order.line_items) ? order.line_items : []).filter(li => {
+    const label = `${li.sku || ""} ${li.title || ""}`.toLowerCase();
+    const isBundle = /bundle|pack/.test(label);
+    const hasChildMarkers = !!bundleKey(li) || hasParentFlag(li) || anyAfterSellKey(li);
+    const hasSub =
+      String(order.tags || "").toLowerCase().includes("subscription") ||
+      !!li.selling_plan_id ||
+      !!(li.selling_plan_allocation && li.selling_plan_allocation.selling_plan_id);
+    return isBundle && hasSub && !hasChildMarkers;
+  });
 
   // --- AfterSell / UpCart detection ---
   for (const li of items) {
@@ -207,10 +218,26 @@ function sbDetectFromOrder(order) {
   const zeroChildren = items.filter(zeroed);
   const nonZero = items.filter(li => !zeroed(li));
   if (zeroChildren.length && nonZero.length >= 1) {
-    return { children: zeroChildren };
+        if (subBundleParents.length) {
+      for (const li of subBundleParents) {
+        console.log("SUB-BUNDLE NO CHILDREN", {
+          id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id
+        });
+      }
+    }
+
+    return { children: zeroChildren, subBundleParents };
   }
   if (zeroChildren.length && tagStr.includes("simple bundles")) {
-    return { children: zeroChildren };
+        if (subBundleParents.length) {
+      for (const li of subBundleParents) {
+        console.log("SUB-BUNDLE NO CHILDREN", {
+          id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id
+        });
+      }
+    }
+
+   return { children: zeroChildren, subBundleParents };
   }
 
   const groups = new Map();
