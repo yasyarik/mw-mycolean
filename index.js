@@ -694,7 +694,7 @@ function minimalXML(o) {
   const ship = filledAddress(o.shipping_address || o.billing_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
-  const lastMod = fmtShipDate(new Date()));
+  const lastMod = fmtShipDate(new Date());
   const shipStationStatus = "awaiting_shipment";
 
   const itemsXml = items.map(i => `
@@ -752,6 +752,7 @@ function minimalXML(o) {
   </Order>
 </Orders>`;
 }
+
 
 function authOK(req) {
   const h = req.headers.authorization || "";
