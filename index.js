@@ -447,6 +447,54 @@ if (!sb && parentsOnly.length) {
     }
     return { after };
   }
+  // STEP 2: resolve children from product/variant metafields (dry-run: logs only)
+  const ubCandidates = [];
+  for (const li of (order.line_items || [])) {
+    const props = Array.isArray(li.properties) ? li.properties : [];
+    const hasUpcartSub = props.some(p => String(p?.name || "").toLowerCase().includes("__upcartsubscriptionupgrade"));
+    const hasPlan = !!(li.selling_plan_id || li.selling_plan_allocation?.selling_plan_id);
+    const isBundleSku = String(li.sku || "").toLowerCase().includes("bundle");
+    const isBundleTitle = String(li.title || "").toLowerCase().includes("bundle");
+    if ((hasUpcartSub || hasPlan) && (isBundleSku || isBundleTitle)) ubCandidates.push(li);
+  }
+
+  for (const li of ubCandidates) {
+    try {
+      const { buildBundleMap } = await import("./scanner_runtime.js");
+
+      let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
+      let recipe = map && map[`variant:${li.variant_id}`];
+
+      if (!Array.isArray(recipe) || !recipe.length) {
+        map = await buildBundleMap({ onlyProductId: String(li.product_id) });
+        recipe = map && map[`product:${li.product_id}`];
+      }
+
+      if (Array.isArray(recipe) && recipe.length) {
+        console.log("META-CHILDREN FOUND", {
+          parent_line_id: li.id,
+          parent_variant_id: li.variant_id,
+          parent_product_id: li.product_id,
+          count: recipe.length
+        });
+        for (const r of recipe) {
+          console.log("META-CHILD", {
+            parent_line_id: li.id,
+            variant_id: r.variantId,
+            qty: r.qty
+          });
+        }
+      } else {
+        console.log("META-CHILDREN NOT FOUND", {
+          parent_line_id: li.id,
+          parent_variant_id: li.variant_id,
+          parent_product_id: li.product_id
+        });
+      }
+    } catch (e) {
+      console.log("META-LOOKUP ERROR", { parent_line_id: li.id, error: String(e?.message || e) });
+    }
+  }
 
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
