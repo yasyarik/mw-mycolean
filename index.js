@@ -94,6 +94,30 @@ function anyAfterSellKey(li){
     return n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
   });
 }
+function detectSubBundleNoChildren(order){
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  if (!items.length) return null;
+  const tagStr = String(order.tags || "").toLowerCase();
+  const sb = sbDetectFromOrder(order);
+  if (sb && Array.isArray(sb.children) && sb.children.length) return null;
+
+  const looksBundle = (li) => {
+    const t = `${li.title || ""} ${li.sku || ""}`.toLowerCase();
+    if (t.includes("bundle") || t.includes("pack")) return true;
+    const props = Array.isArray(li.properties) ? li.properties : [];
+    return props.some(p => {
+      const n = String(p?.name || "").toLowerCase();
+      return n.includes("_sb_") || n.includes("bundle");
+    });
+  };
+
+  const isSubscription = (li) => !!(li.selling_plan_id || li.selling_plan_allocation?.selling_plan_id);
+
+  const parents = items.filter(li => isSubscription(li) && looksBundle(li));
+  if (parents.length === 1 && items.length === 1) return parents[0];
+  if (parents.length === 1 && tagStr.includes("simple bundles")) return parents[0];
+  return null;
+}
 
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
@@ -356,6 +380,15 @@ async function transformOrder(order) {
   const tags = String(order.tags || "").toLowerCase();
   const anyBundle = sbDetectFromOrder(order);
   const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
+const subBundleParent = detectSubBundleNoChildren(order);
+if (subBundleParent) {
+  console.log("SUB-BUNDLE NO CHILDREN", {
+    id: subBundleParent.id,
+    title: subBundleParent.title,
+    sku: subBundleParent.sku || null,
+    variant_id: subBundleParent.variant_id || null
+  });
+}
 
   if (!anyBundle && !hasBundleTag) {
     console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
