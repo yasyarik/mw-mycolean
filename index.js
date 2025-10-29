@@ -2,6 +2,21 @@ import express from "express";
 import dotenv from "dotenv";
 import getRawBody from "raw-body";
 import crypto from "crypto";
+// Локальная карта разложения бандлов (только список variantId)
+const LOCAL_BUNDLE_MAP = {
+  "product:10345847423286": [
+    "53024505037110",
+    "53024540426550",
+    "53024503922998",
+    "53024542261558"
+  ],
+  "variant:53042694160694": [
+    "53024505037110",
+    "53024540426550",
+    "53024503922998",
+    "53024542261558"
+  ]
+};
 
 dotenv.config();
 const app = express();
@@ -518,6 +533,22 @@ async function transformOrder(order) {
         if (!kids.length) {
           map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
           kids = map[`variant:${li.variant_id}`] || [];
+          // fallback на локальную карту, если scanner не дал детей
+
+          
+if (!kids.length) {
+  const local = LOCAL_BUNDLE_MAP[`product:${li.product_id}`] || LOCAL_BUNDLE_MAP[`variant:${li.variant_id}`] || [];
+  if (local.length) {
+    kids = local.map(v => ({ variantId: v }));
+    console.log(__ORD, "LOCAL MAP EXPANSION (SUB PARENT)", {
+      li_id: li.id,
+      product_id: li.product_id,
+      variant_id: li.variant_id,
+      found_children: kids.length
+    });
+  }
+}
+
           if (!kids.length) {
             const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
             if (vKeys.length === 1) kids = map[vKeys[0]] || [];
@@ -533,21 +564,25 @@ async function transformOrder(order) {
           });
 
           for (const ch of kids) {
-            const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
-            const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
-            if (!vid) continue;
+        const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
+if (!vid) continue;
 
-            const vb = await getVariantBasics(vid);
-            const imageUrl = await getVariantImage(vid);
+const vb = await getVariantBasics(vid);
+const imageUrl = await getVariantImage(vid);
 
-            after.push({
-              id: `${li.id}:${vid}`,
-              title: vb.title,
-              sku: vb.sku,
-              qty: qty * (li.quantity || 1),
-              unitPrice: vb.price,
-              imageUrl
-            });
+// количество берём ТОЛЬКО из родителя
+const qty = Math.max(1, Number(li.quantity || 1));
+
+after.push({
+  id: `${li.id}:${vid}`,
+  title: vb.title,
+  sku: vb.sku,
+  qty,
+  unitPrice: vb.price,
+  imageUrl
+});
+
+         
           }
         } else {
           console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS", {
@@ -574,58 +609,80 @@ async function transformOrder(order) {
     if ((hasUpcartSub || hasPlan) && (isBundleSku || isBundleTitle)) ubCandidates.push(li);
   }
 
-  for (const li of ubCandidates) {
-    try {
-      const { buildBundleMap } = await import("./scanner_runtime.js");
+for (const li of ubCandidates) {
+  try {
+    const { buildBundleMap } = await import("./scanner_runtime.js");
 
-      let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-      let recipe = map[`variant:${li.variant_id}`];
+    // 1) Пробуем по варианту
+    let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
+    let kids = map[`variant:${li.variant_id}`] || [];
 
-      if (!Array.isArray(recipe) || !recipe.length) {
-        map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-        recipe = map[`product:${li.product_id}`];
-        if (!recipe || !recipe.length) {
-          const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
-          if (vKeys.length === 1) recipe = map[vKeys[0]] || [];
-        }
+    // 2) Если пусто — пробуем по продукту
+    if (!kids.length) {
+      map = await buildBundleMap({ onlyProductId: String(li.product_id) });
+      kids = map[`product:${li.product_id}`] || [];
+
+      // донор-variant, если карта вернула единственный variant:*
+      if (!kids.length) {
+        const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
+        if (vKeys.length === 1) kids = map[vKeys[0]] || [];
       }
+    }
 
-      if (Array.isArray(recipe) && recipe.length) {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT", {
+    // 3) Фоллбек на локальную карту
+    if (!kids.length) {
+      const local = LOCAL_BUNDLE_MAP[`product:${li.product_id}`] || LOCAL_BUNDLE_MAP[`variant:${li.variant_id}`] || [];
+      if (local.length) {
+        kids = local.map(v => ({ variantId: v }));
+        console.log(__ORD, "LOCAL MAP EXPANSION (UB PARENT)", {
           li_id: li.id,
           product_id: li.product_id,
           variant_id: li.variant_id,
-          found_children: recipe.length
-        });
-        for (const r of recipe) {
-          const vid = String(r.variantId || r.variant_id || r.id || "").trim();
-          const qty = Math.max(1, Number(r.qty || r.quantity || 1));
-          if (!vid) continue;
-
-          const vb = await getVariantBasics(vid);
-          const imageUrl = await getVariantImage(vid);
-
-          after.push({
-            id: `${li.id}:${vid}`,
-            title: vb.title,
-            sku: vb.sku,
-            qty: qty * (li.quantity || 1),
-            unitPrice: vb.price,
-            imageUrl
-          });
-        }
-        handled.add(li.id);
-      } else {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id
+          found_children: kids.length
         });
       }
-    } catch (e) {
-      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
     }
+
+    if (kids.length) {
+      console.log(__ORD, "SCANNER EXPAND UB PARENT", {
+        li_id: li.id,
+        product_id: li.product_id,
+        variant_id: li.variant_id,
+        found_children: kids.length
+      });
+
+      for (const ch of kids) {
+        const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
+        if (!vid) continue;
+
+        const vb = await getVariantBasics(vid);
+        const imageUrl = await getVariantImage(vid);
+
+        // количество берём ТОЛЬКО из родителя
+        const qty = Math.max(1, Number(li.quantity || 1));
+
+        after.push({
+          id: `${li.id}:${vid}`,
+          title: vb.title,
+          sku: vb.sku,
+          qty,
+          unitPrice: vb.price,
+          imageUrl
+        });
+      }
+      handled.add(li.id);
+    } else {
+      console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
+        li_id: li.id,
+        product_id: li.product_id,
+        variant_id: li.variant_id
+      });
+    }
+  } catch (e) {
+    console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
   }
+}
+
 
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
