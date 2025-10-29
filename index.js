@@ -525,8 +525,47 @@ function authOK(req) {
   return false;
 }
 
-app.use("/shipstation", (req, res) => {
+app.use("/shipstation", async (req, res) => {
   res.set("Content-Type", "application/xml; charset=utf-8");
+
+  const checkId = req.query.checkorder_id;
+  if (checkId) {
+    const shop = process.env.SHOPIFY_SHOP;
+    const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+    if (!shop || !admin) {
+      res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Shopify creds missing</Error>`);
+      return;
+    }
+    try {
+      const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(checkId)}.json`, {
+        headers: { "X-Shopify-Access-Token": admin }
+      });
+      if (!r.ok) {
+        const body = await r.text().catch(()=>"");
+        res.status(502).send(`<?xml version="1.0" encoding="utf-8"?><Error>Shopify fetch failed ${r.status} ${r.statusText} ${esc(body)}</Error>`);
+        return;
+      }
+      const data = await r.json();
+      const order = data.order || data;
+      const conv = await transformOrder(order);
+      remember({
+        id: order.id,
+        name: order.name,
+        email: order.email || "",
+        shipping_address: order.shipping_address || {},
+        billing_address: order.billing_address || {},
+        payload: conv,
+        created_at: order.created_at || new Date().toISOString()
+      });
+      statusById.set(order.id, "awaiting_shipment");
+      const xml = minimalXML(bestById.get(String(order.id)));
+      res.status(200).send(xml);
+      return;
+    } catch (e) {
+      res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Reprocess error</Error>`);
+      return;
+    }
+  }
 
   if (!process.env.SS_USER || !process.env.SS_PASS || !authOK(req)) {
     res.status(401).send(`<?xml version="1.0" encoding="utf-8"?><Error>Authentication failed</Error>`);
@@ -542,6 +581,7 @@ app.use("/shipstation", (req, res) => {
   }
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
+
 
 app.get("/health", (req, res) => res.send("OK"));
 
