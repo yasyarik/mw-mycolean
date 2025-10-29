@@ -157,6 +157,8 @@ function detectSubBundleParentOnly(order) {
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
+  const __ORD = `[ORDER ${order.id} ${order.name || ''}]`;
+
   if (!items.length) return null;
 
   const json = JSON.stringify(order).toLowerCase();
@@ -197,11 +199,13 @@ function sbDetectFromOrder(order) {
           price: toNum(c.price || 0),
           variant_id: c.variant_id || c.id || null
         }));
-        console.log(`AfterSell/UpCart bundle detected: ${children.length} children`);
+        console.log(__ORD, `AfterSell/UpCart bundle detected: ${children.length} children`);
+
         return { children };
       }
     } catch (e) {
-      console.log("AfterSell/UpCart parse error:", e.message);
+      console.log(__ORD, "AfterSell/UpCart parse error:", e.message);
+
     }
   }
 
@@ -220,9 +224,8 @@ function sbDetectFromOrder(order) {
   if (zeroChildren.length && nonZero.length >= 1) {
         if (subBundleParents.length) {
       for (const li of subBundleParents) {
-        console.log("SUB-BUNDLE NO CHILDREN", {
-          id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id
-        });
+console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
+
       }
     }
 
@@ -231,9 +234,8 @@ function sbDetectFromOrder(order) {
   if (zeroChildren.length && tagStr.includes("simple bundles")) {
         if (subBundleParents.length) {
       for (const li of subBundleParents) {
-        console.log("SUB-BUNDLE NO CHILDREN", {
-          id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id
-        });
+console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
+
       }
     }
 
@@ -470,7 +472,8 @@ if (!sb && parentsOnly.length) {
       handled.add(c.id);
       const imageUrl = await getVariantImage(c.variant_id);
       pushLine(after, c, imageUrl);
-      console.log("SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
+     console.log(`[ORDER ${order.id} ${order.name || ''}]`, "SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
+
     }
     return { after };
   }
