@@ -571,6 +571,13 @@ for (const li of (order.line_items || [])) {
       // 1) Пробуем по продукту
       let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
       let kids = map[`product:${li.product_id}`] || [];
+      if (!kids.length) {
+        const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
+        if (vKeys.length === 1) {
+          kids = map[vKeys[0]] || [];
+          console.log(`[ORDER ${order.id} ${order.name}] SCANNER FALLBACK donor-variant → used ${vKeys[0]} (${kids.length})`);
+        }
+      }
 
       // 2) Если пусто — пробуем по варианту
       if (!kids.length) {
