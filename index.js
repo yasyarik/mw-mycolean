@@ -548,8 +548,8 @@ app.get("/health", (req, res) => res.send("OK"));
 const PORT = process.env.PORT || 8080;
 
 
-  console.log("ShipStation refreshstore →", res.status, await res.text());
-}
+ 
+
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
