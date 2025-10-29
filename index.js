@@ -458,96 +458,43 @@ async function getVariantBasics(variantId) {
 }
 
 async function transformOrder(order) {
+  const __ORD = `[ORDER ${order.id} ${order.name || ''}]`;
+
   const after = [];
   const handled = new Set();
   const tags = String(order.tags || "").toLowerCase();
-  const __ORD = `[ORDER ${order.id} ${order.name || ""}]`;
+  const anyBundle = sbDetectFromOrder(order);
+  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
+const subBundleParent = detectSubBundleNoChildren(order);
+if (subBundleParent) {
+console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: subBundleParent.id, title: subBundleParent.title, sku: subBundleParent.sku || null, variant_id: subBundleParent.variant_id || null });
 
-  const hasBundleTag =
-    tags.includes("simple bundles") ||
-    tags.includes("bundle") ||
-    tags.includes("skio") ||
-    tags.includes("aftersell");
+}
 
-  const sb = sbDetectFromOrder(order);
-
-  if (!sb && !hasBundleTag) {
-    console.log(__ORD, "SKIP ORDER (no bundle detected)");
+  if (!anyBundle && !hasBundleTag) {
+    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
     return { after: [] };
   }
 
-  if (sb) {
-    if (Array.isArray(sb.children)) {
-      for (const c of sb.children) {
-        handled.add(c.id);
-        const imageUrl = await getVariantImage(c.variant_id);
-        pushLine(after, c, imageUrl);
-        console.log(__ORD, "SB CHILD", {
-          id: c.id,
-          title: c.title,
-          variant_id: c.variant_id,
-          imageUrl: imageUrl ? "OK" : "NO"
-        });
-      }
-    }
-
-    const subParents = Array.isArray(sb.subBundleParents) ? sb.subBundleParents : [];
-    for (const li of subParents) {
-      try {
-        const { buildBundleMap } = await import("./scanner_runtime.js");
-
-        let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-        let kids = map[`product:${li.product_id}`] || [];
-
-        if (!kids.length) {
-          map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-          kids = map[`variant:${li.variant_id}`] || [];
-          if (!kids.length) {
-            const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
-            if (vKeys.length === 1) kids = map[vKeys[0]] || [];
-          }
-        }
-
-        if (kids.length) {
-          console.log(__ORD, "SCANNER EXPAND SUB PARENT", {
-            li_id: li.id,
-            product_id: li.product_id,
-            variant_id: li.variant_id,
-            found_children: kids.length
-          });
-
-          for (const ch of kids) {
-            const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
-            const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
-            if (!vid) continue;
-
-            const vb = await getVariantBasics(vid);
-            const imageUrl = await getVariantImage(vid);
-
-            after.push({
-              id: `${li.id}:${vid}`,
-              title: vb.title,
-              sku: vb.sku,
-              qty: qty * (li.quantity || 1),
-              unitPrice: vb.price,
-              imageUrl
-            });
-          }
-        } else {
-          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS", {
-            li_id: li.id,
-            product_id: li.product_id,
-            variant_id: li.variant_id
-          });
-        }
-      } catch (e) {
-        console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
-      }
-    }
-
-    if (after.length) return { after };
+  const sb = sbDetectFromOrder(order);
+  const parentsOnly = detectSubBundleParentOnly(order);
+if (!sb && parentsOnly.length) {
+  for (const p of parentsOnly) {
+    console.log(__ORD, "SUB-BUNDLE NO CHILDREN", p);
   }
+}
 
+  if (sb) {
+    for (const c of sb.children) {
+      handled.add(c.id);
+      const imageUrl = await getVariantImage(c.variant_id);
+      pushLine(after, c, imageUrl);
+     console.log(`[ORDER ${order.id} ${order.name || ''}]`, "SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
+
+    }
+    return { after };
+  }
+  // STEP 2: resolve children from product/variant metafields (dry-run: logs only)
   const ubCandidates = [];
   for (const li of (order.line_items || [])) {
     const props = Array.isArray(li.properties) ? li.properties : [];
@@ -563,27 +510,85 @@ async function transformOrder(order) {
       const { buildBundleMap } = await import("./scanner_runtime.js");
 
       let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-      let recipe = map[`variant:${li.variant_id}`];
+      let recipe = map && map[`variant:${li.variant_id}`];
 
       if (!Array.isArray(recipe) || !recipe.length) {
         map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-        recipe = map[`product:${li.product_id}`];
-        if (!recipe || !recipe.length) {
-          const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
-          if (vKeys.length === 1) recipe = map[vKeys[0]] || [];
-        }
+        recipe = map && map[`product:${li.product_id}`];
       }
 
       if (Array.isArray(recipe) && recipe.length) {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT", {
+        console.log("META-CHILDREN FOUND", {
+          parent_line_id: li.id,
+          parent_variant_id: li.variant_id,
+          parent_product_id: li.product_id,
+          count: recipe.length
+        });
+        for (const r of recipe) {
+          console.log("META-CHILD", {
+            parent_line_id: li.id,
+            variant_id: r.variantId,
+            qty: r.qty
+          });
+        }
+      } else {
+        console.log("META-CHILDREN NOT FOUND", {
+          parent_line_id: li.id,
+          parent_variant_id: li.variant_id,
+          parent_product_id: li.product_id
+        });
+      }
+    } catch (e) {
+      console.log("META-LOOKUP ERROR", { parent_line_id: li.id, error: String(e?.message || e) });
+    }
+  }
+
+for (const li of (order.line_items || [])) {
+  if (handled.has(li.id)) continue;
+
+  const props = Array.isArray(li.properties) ? li.properties : [];
+  const looksBundle =
+    /bundle/i.test(li.title || "") ||
+    /bundle/i.test(li.sku || "") ||
+    tags.includes("bundle") ||
+    tags.includes("simple bundles");
+
+  const isSubscription =
+    !!(li.selling_plan_id || li.selling_plan_allocation?.selling_plan_id) ||
+    tags.includes("subscription");
+
+  const hasExplicitChildrenInProps = props.some(p => {
+    const n = String(p?.name || "").toLowerCase();
+    return n.includes("children") || n.includes("components") || n.includes("variant_id");
+  });
+
+  let expanded = false;
+
+  if (looksBundle && !hasExplicitChildrenInProps) {
+    try {
+      const { buildBundleMap } = await import("./scanner_runtime.js");
+
+      // 1) Пробуем по продукту
+      let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
+      let kids = map[`product:${li.product_id}`] || [];
+
+      // 2) Если пусто — пробуем по варианту
+      if (!kids.length) {
+        map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
+        kids = map[`variant:${li.variant_id}`] || [];
+      }
+
+      if (kids.length) {
+        console.log(`[ORDER ${order.id} ${order.name}] SCANNER EXPAND ${isSubscription ? "SUB" : "UB"} NO CHILDREN`, {
           li_id: li.id,
           product_id: li.product_id,
           variant_id: li.variant_id,
-          found_children: recipe.length
+          found_children: kids.length
         });
-        for (const r of recipe) {
-          const vid = String(r.variantId || r.variant_id || r.id || "").trim();
-          const qty = Math.max(1, Number(r.qty || r.quantity || 1));
+
+        for (const ch of kids) {
+          const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
+          const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
           if (!vid) continue;
 
           const vb = await getVariantBasics(vid);
@@ -594,25 +599,20 @@ async function transformOrder(order) {
             title: vb.title,
             sku: vb.sku,
             qty: qty * (li.quantity || 1),
-            unitPrice: vb.price,
+            unitPrice: vb.price,       // цена ребёнка — реальная, не делим
             imageUrl
           });
         }
-        handled.add(li.id);
-      } else {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id
-        });
+        expanded = true;
+        continue; // родителя не добавляем
       }
     } catch (e) {
-      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
+      console.log(`[ORDER ${order.id} ${order.name}] SCANNER EXPAND ERROR`, String(e && e.message || e));
     }
   }
 
-  for (const li of (order.line_items || [])) {
-    if (handled.has(li.id)) continue;
+  // Фоллбэк: если не развернули — пихаем как есть
+  if (!expanded) {
     const imageUrl = await getVariantImage(li.variant_id);
     after.push({
       id: li.id,
@@ -623,10 +623,11 @@ async function transformOrder(order) {
       imageUrl
     });
   }
+}
+
 
   return { after };
 }
-
 
 async function handleOrderCreateOrUpdate(req, res) {
   try {
