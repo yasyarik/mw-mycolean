@@ -343,26 +343,27 @@ async function transformOrder(order) {
     tags.includes("skio") ||
     tags.includes("aftersell") ||
     tags.includes("subscription");
-  const sub = isSubscription(order);
-
   const sb = sbDetectFromOrder(order);
 
-  // если нет ни детектора, ни тегов/подписки — всё равно не выходим: возможно есть рецепт в карте для конкретной линии
-
-  // 1) дети, найденные детектором (цены и поведение — как было)
+  // 1) Если есть нулевые дети/апселлы — добавляем их, НО НЕ ВЫХОДИМ
   if (sb && Array.isArray(sb.children) && sb.children.length) {
     for (const c of sb.children) {
       handled.add(c.id);
       const imageUrl = await getVariantImage(c.variant_id);
       pushLine(after, c, imageUrl);
       console.log("SB CHILD", {
-        id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO"
+        id: c.id,
+        title: c.title,
+        variant_id: c.variant_id,
+        imageUrl: imageUrl ? "OK" : "NO"
       });
     }
   }
 
-  // 2) разложение оставшихся позиций по рецепту из карты (реальные цены детей из variants/{id}.json)
-  for (const li of Array.isArray(order.line_items) ? order.line_items : []) {
+  // 2) Для каждой ещё не обработанной позиции пробуем рецепт из сканера
+  let expandedByScanner = false;
+  const items = Array.isArray(order.line_items) ? order.line_items : [];
+  for (const li of items) {
     if (handled.has(li.id)) continue;
 
     try {
@@ -370,11 +371,13 @@ async function transformOrder(order) {
       if (Array.isArray(comps) && comps.length) {
         handled.add(li.id);
         const parentQty = toNum(li.quantity || 1);
+
         for (const c of comps) {
           const childVid = String(c.variantId || c.variant_id || "");
-          const unit = await fetchVariantPrice(childVid);
+          const unit = await fetchVariantPrice(childVid);   // реальная цена варианта
           const qty = (toNum(c.qty || c.quantity || 1)) * parentQty;
           const imageUrl = await getVariantImage(childVid);
+
           after.push({
             id: `${li.id}::${childVid}`,
             title: li.title,
@@ -384,14 +387,22 @@ async function transformOrder(order) {
             imageUrl: imageUrl || ""
           });
         }
+
+        expandedByScanner = true;
+        console.log("SCANNER EXPANDED", {
+          li_id: li.id,
+          product_id: li.product_id,
+          variant_id: li.variant_id,
+          children: comps.length
+        });
       }
     } catch (e) {
       console.error("scanner expand error:", e);
     }
   }
 
-  // 3) всё, что не обработано — как есть
-  for (const li of Array.isArray(order.line_items) ? order.line_items : []) {
+  // 3) Всё, что не обработано — как есть
+  for (const li of items) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
     after.push({
@@ -404,13 +415,15 @@ async function transformOrder(order) {
     });
   }
 
-  // если ничего не собрали и при этом не было ни тега/подписки, ни рецепта — это «обычный» заказ: вернём пусто
-  if (!after.length && !hasBundleTag && !sub) {
-    console.log("SKIP ORDER (no signals and no recipe):", order.id, order.name);
+  // Если вообще нет признаков бандла и ничего не разложили, просто вернём как есть
+  if (!after.length && !hasBundleTag && !(sb && sb.children && sb.children.length)) {
+    console.log("SKIP ORDER (no bundle/subscription detected):", order.id, order.name);
     return { after: [] };
   }
+
   return { after };
 }
+
 
 /* ==================== webhooks ==================== */
 
