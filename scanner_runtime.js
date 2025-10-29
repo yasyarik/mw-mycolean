@@ -1,5 +1,3 @@
-// scanner_runtime.js — скан + дамп метаполей (без HasMetafieldsIdentifier)
-
 const NS_KEYS = [
   ["simple_bundles_2_0","components"],
   ["simple_bundles","components"],
@@ -11,7 +9,8 @@ const NS_KEYS = [
   ["bundles","bundle_components"],
   ["simple_bundles_2_0","components_json"],
   ["simple_bundles","components_json"],
-  ["bundles","components_json"]
+  ["bundles","components_json"],
+  ["simple_bundles","bundled_variants"]
 ];
 
 function parseRecipeArray(raw){
@@ -28,7 +27,7 @@ function parseRecipeArray(raw){
   for(const it of list){
     if(!it) continue;
     const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//,"");
-    const qty = Number(it.quantity || it.qty || it.qty_each || it.count || 0);
+    const qty = Number(it.quantity || it.qty || it.qty_each || it.count || it.quantity_in_bundle || 0);
     if(vid && qty>0) out.push({ variantId: vid, qty });
   }
   return out;
@@ -124,8 +123,6 @@ export async function buildBundleMap({ onlyProductId=null } = {}){
   return map;
 }
 
-/* === DIAGNOSTICS: полный дамп метаполей через GQL с fallback на REST === */
-
 async function restJson(path){
   const shop  = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
@@ -143,7 +140,6 @@ export async function dumpMeta(productId){
   const pid = String(productId);
   const out = { productId: pid, product: [], variants: {} };
 
-  // 1) пытаемся через GraphQL
   const query = `
     query DumpMeta($pid:ID!){
       product(id:$pid){
@@ -178,11 +174,8 @@ export async function dumpMeta(productId){
       }
       return { ok:true, via:"graphql", ...out };
     }
-  }catch(e){
-    // пойдём REST’ом ниже
-  }
+  }catch(e){}
 
-  // 2) fallback: REST
   try{
     const p = await restJson(`/products/${pid}.json`);
     const variants = Array.isArray(p?.product?.variants) ? p.product.variants : [];
