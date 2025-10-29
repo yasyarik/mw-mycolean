@@ -305,6 +305,37 @@ function getLastOrder() {
 }
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
+async function replayLatestFromShopify(limit = 10) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!shop || !admin) return { ok: false, reason: "no_creds" };
+  try {
+    const n = Math.max(1, Math.min(50, Number(limit) || 10));
+    const r = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=${n}&status=any&order=created_at%20desc`, {
+      headers: { "X-Shopify-Access-Token": admin }
+    });
+    if (!r.ok) return { ok: false, reason: `http_${r.status}` };
+    const data = await r.json();
+    const list = Array.isArray(data.orders) ? data.orders : [];
+    for (const order of list) {
+      const conv = await transformOrder(order);
+      remember({
+        id: order.id,
+        name: order.name,
+        email: order.email || "",
+        shipping_address: order.shipping_address || {},
+        billing_address: order.billing_address || {},
+        payload: conv,
+        created_at: order.created_at || new Date().toISOString()
+      });
+      statusById.set(order.id, "awaiting_shipment");
+    }
+    await ssRefreshNow();
+    return { ok: true, replayed: list.length };
+  } catch (e) {
+    return { ok: false, reason: String(e && e.message || e) };
+  }
+}
 
 function isMWOrder(order, conv){
   try {
@@ -849,6 +880,13 @@ app.get("/health", async (req, res) => {
       res.status(200).send(JSON.stringify({ ok: true, keys: Object.keys(map).length, map }, null, 2));
       return;
     }
+    if (req.query && req.query.replay_latest) {
+      const n = Math.max(1, Math.min(50, Number(req.query.replay_latest) || 10));
+      const out = await replayLatestFromShopify(n);
+      res.set("Content-Type", "application/json; charset=utf-8");
+      res.status(200).send(JSON.stringify({ ok: true, ...out }, null, 2));
+      return;
+    }
 
     res.send("ok");
   } catch (e) {
@@ -864,4 +902,12 @@ const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+    const REPLAY_INTERVAL_MS = Number(process.env.REPLAY_INTERVAL_MS || 30000);
+  const REPLAY_TAIL = Number(process.env.REPLAY_TAIL || 10);
+  if (REPLAY_INTERVAL_MS > 0) {
+    setInterval(() => {
+      replayLatestFromShopify(REPLAY_TAIL).catch(() => {});
+    }, REPLAY_INTERVAL_MS);
+  }
+
 });
