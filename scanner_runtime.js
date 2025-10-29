@@ -1,203 +1,252 @@
-// scanner_runtime.js
-// Работает через REST Admin API. Не требует GraphQL схем HasMetafieldsIdentifier.
-// Ничего не меняет в логике цен/ордеров — только сканирование рецептов бандлов.
+const SHOP = process.env.SHOPIFY_SHOP;
+const TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
-const API_VERSION = "2025-01";
+const SB_NS_CANDIDATES = [
+  { ns: "simple_bundles_2_0", key: "components" },
+  { ns: "simple_bundles", key: "components" },
+  { ns: "simplebundles", key: "components" },
+  { ns: "bundles", key: "components" }
+];
 
-function envOrThrow(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`${name} is not set`);
-  return v;
-}
 function toNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : 0;
 }
-async function fetchJSON(url, opts = {}) {
-  const res = await fetch(url, opts);
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${res.statusText} :: ${t}`);
+
+async function adminFetch(path) {
+  const url = `https://${SHOP}/admin/api/2025-01${path}`;
+  const r = await fetch(url, { headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" } });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`HTTP ${r.status} ${r.statusText} ${t}`);
   }
-  return res.json();
+  return r;
 }
 
-// ---------- REST helpers ----------
-async function getProduct(productId) {
-  const shop = envOrThrow("SHOPIFY_SHOP");
-  const token = envOrThrow("SHOPIFY_ADMIN_ACCESS_TOKEN");
-  const url = `https://${shop}/admin/api/${API_VERSION}/products/${productId}.json`;
-  const j = await fetchJSON(url, { headers: { "X-Shopify-Access-Token": token } });
-  return j.product;
+async function listAllProducts() {
+  const out = [];
+  let since = 0;
+  for (;;) {
+    const r = await adminFetch(`/products.json?fields=id&limit=250${since ? `&since_id=${since}` : ""}`);
+    const j = await r.json();
+    const arr = Array.isArray(j.products) ? j.products : [];
+    if (!arr.length) break;
+    for (const p of arr) out.push({ id: p.id });
+    since = arr[arr.length - 1].id;
+    if (arr.length < 250) break;
+  }
+  return out;
 }
-async function listProductMetafields(productId) {
-  const shop = envOrThrow("SHOPIFY_SHOP");
-  const token = envOrThrow("SHOPIFY_ADMIN_ACCESS_TOKEN");
-  const url = `https://${shop}/admin/api/${API_VERSION}/products/${productId}/metafields.json`;
-  const j = await fetchJSON(url, { headers: { "X-Shopify-Access-Token": token } });
-  return Array.isArray(j.metafields) ? j.metafields : [];
-}
-async function listVariantMetafields(variantId) {
-  const shop = envOrThrow("SHOPIFY_SHOP");
-  const token = envOrThrow("SHOPIFY_ADMIN_ACCESS_TOKEN");
-  const url = `https://${shop}/admin/api/${API_VERSION}/variants/${variantId}/metafields.json`;
-  const j = await fetchJSON(url, { headers: { "X-Shopify-Access-Token": token } });
-  return Array.isArray(j.metafields) ? j.metafields : [];
-}
+
 async function listProductVariants(productId) {
-  const shop = envOrThrow("SHOPIFY_SHOP");
-  const token = envOrThrow("SHOPIFY_ADMIN_ACCESS_TOKEN");
-  const url = `https://${shop}/admin/api/${API_VERSION}/products/${productId}/variants.json?limit=250`;
-  const j = await fetchJSON(url, { headers: { "X-Shopify-Access-Token": token } });
-  return Array.isArray(j.variants) ? j.variants : [];
+  const r = await adminFetch(`/products/${productId}.json?fields=variants`);
+  const j = await r.json();
+  const v = Array.isArray(j.product?.variants) ? j.product.variants : [];
+  return v.map(x => ({ id: x.id }));
 }
 
-// ---------- parsing ----------
-const SB_NS_CANDIDATES = [
-  { ns: "simple_bundles_2_0", key: "components" },
-  { ns: "simple_bundles",     key: "components" },
-  { ns: "simplebundles",      key: "components" },
-  { ns: "bundles",            key: "components" },
-];
-
-function parseGidVariantId(g) {
-  if (!g) return null;
-  const s = String(g);
-  const m = s.match(/ProductVariant\/(\d+)/);
-  return m ? m[1] : (s.match(/^\d+$/) ? s : null);
+async function listProductMetafields(productId) {
+  let out = [];
+  let page = null;
+  for (;;) {
+    const r = await adminFetch(`/products/${productId}/metafields.json?limit=250${page ? `&page_info=${encodeURIComponent(page)}` : ""}`);
+    const j = await r.json();
+    const arr = Array.isArray(j.metafields) ? j.metafields : [];
+    out = out.concat(arr.map(m => ({ namespace: m.namespace, key: m.key, value: m.value, type: m.type })));
+    const link = r.headers.get("link") || "";
+    const m = link.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/i);
+    if (m) { page = m[1]; continue; }
+    break;
+  }
+  return out;
 }
 
-function parseRecipeFromValue(value, type) {
-  // 1) Если это list.product_variant_reference → value как правило JSON или CSV GID’ов
+async function listVariantMetafields(variantId) {
+  let out = [];
+  let page = null;
+  for (;;) {
+    const r = await adminFetch(`/variants/${variantId}/metafields.json?limit=250${page ? `&page_info=${encodeURIComponent(page)}` : ""}`);
+    const j = await r.json();
+    const arr = Array.isArray(j.metafields) ? j.metafields : [];
+    out = out.concat(arr.map(m => ({ namespace: m.namespace, key: m.key, value: m.value, type: m.type })));
+    const link = r.headers.get("link") || "";
+    const m = link.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/i);
+    if (m) { page = m[1]; continue; }
+    break;
+  }
+  return out;
+}
+
+function validateVariantId(x, knownVariantIds = null) {
+  const s = String(x || "").trim();
+  if (!/^\d{6,}$/.test(s)) return null;
+  if (knownVariantIds && !knownVariantIds.has(s)) return null;
+  return s;
+}
+
+function normalizeRecipe(list, knownVariantIds = null) {
+  const out = [];
+  for (const it of list || []) {
+    const vid = validateVariantId(it.variantId, knownVariantIds);
+    const qty = Math.max(1, Number(it.qty || 1));
+    if (vid) out.push({ variantId: vid, qty });
+  }
+  return out;
+}
+
+function parseRecipeFromValue(value, type, knownVariantIds = null) {
   if (String(type || "").includes("product_variant_reference")) {
     try {
-      const parsed = JSON.parse(value);
+      const parsed = JSON.parse(String(value));
       const arr = Array.isArray(parsed) ? parsed : [parsed];
-      const out = [];
+      const tmp = [];
       for (const it of arr) {
-        const vid = parseGidVariantId(it?.id || it);
-        if (vid) out.push({ variantId: vid, qty: 1 });
+        const raw = it?.id ?? it;
+        const m = String(raw || "").match(/ProductVariant\/(\d+)/);
+        const vid = m ? m[1] : null;
+        if (vid) tmp.push({ variantId: vid, qty: 1 });
       }
-      if (out.length) return out;
+      return normalizeRecipe(tmp, knownVariantIds);
     } catch (_) {
-      // попробуем CSV/строку
-      const parts = String(value || "")
-        .split(/[\s,;\|]+/).map(s => s.trim()).filter(Boolean);
-      const out = [];
+      const parts = String(value || "").split(/[\s,;|]+/).map(s => s.trim()).filter(Boolean);
+      const tmp = [];
       for (const p of parts) {
-        const vid = parseGidVariantId(p);
-        if (vid) out.push({ variantId: vid, qty: 1 });
+        const m = p.match(/ProductVariant\/(\d+)/) || p.match(/^(\d{6,})$/);
+        if (m) tmp.push({ variantId: m[1], qty: 1 });
       }
-      if (out.length) return out;
+      return normalizeRecipe(tmp, knownVariantIds);
     }
   }
-
-  // 2) Попытка как JSON со структурой объектов
   try {
     const parsed = JSON.parse(String(value));
-    const arr = Array.isArray(parsed)
-      ? parsed
-      : (Array.isArray(parsed?.components) ? parsed.components : null);
+    const arr = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.components) ? parsed.components : null);
     if (arr && arr.length) {
-      const out = [];
+      const tmp = [];
       for (const it of arr) {
-        const vid = parseGidVariantId(it?.variantId || it?.variant_id || it?.id);
-        const qty = toNum(it?.qty || it?.quantity || it?.qty_each || 1) || 1;
-        if (vid) out.push({ variantId: vid, qty });
+        const raw = it?.variantId || it?.variant_id || (typeof it?.id === "string" && it.id.includes("ProductVariant/") ? it.id : it?.id);
+        let vid = null;
+        if (typeof raw === "string" && raw.includes("ProductVariant/")) {
+          const m = raw.match(/ProductVariant\/(\d+)/);
+          if (m) vid = m[1];
+        } else if (/^\d{6,}$/.test(String(raw || ""))) {
+          vid = String(raw);
+        }
+        const qty = Math.max(1, Number(it?.qty || it?.quantity || it?.qty_each || 1));
+        if (vid) tmp.push({ variantId: vid, qty });
       }
-      if (out.length) return out;
+      return normalizeRecipe(tmp, knownVariantIds);
     }
   } catch (_) {}
-
-  // 3) Плоские пары "variantId:qty" в строке
   const flat = String(value || "");
   if (flat) {
-    const out = [];
-    for (const token of flat.split(/[,;\|]/)) {
-      const m = String(token).trim()
-        .match(/(?:ProductVariant\/)?(\d+)\s*:\s*(\d+)/i);
-      if (m) out.push({ variantId: m[1], qty: toNum(m[2]) || 1 });
+    const tmp = [];
+    for (const token of flat.split(/[,;|]/)) {
+      const m = token.trim().match(/(?:ProductVariant\/)?(\d{6,})\s*:\s*(\d+)/i);
+      if (m) tmp.push({ variantId: m[1], qty: Number(m[2]) || 1 });
     }
-    if (out.length) return out;
+    return normalizeRecipe(tmp, knownVariantIds);
   }
-
-  return null;
+  return [];
 }
 
-function pickRecipeFromMetafields(mfs) {
-  if (!Array.isArray(mfs) || !mfs.length) return null;
-  // Сначала пробуем приоритетные namespace/key
+function pickRecipeFromMetafields(mfs, knownVariantIds = null) {
+  if (!Array.isArray(mfs) || !mfs.length) return [];
   for (const cand of SB_NS_CANDIDATES) {
     const mf = mfs.find(m => m.namespace === cand.ns && m.key === cand.key && m.value);
     if (mf) {
-      const parsed = parseRecipeFromValue(mf.value, mf.type);
-      if (parsed && parsed.length) return parsed;
+      const r = parseRecipeFromValue(mf.value, mf.type, knownVariantIds);
+      if (r.length) return r;
     }
   }
-  // Если нет — перебираем все метаполя в поиске похожих структур
   for (const mf of mfs) {
     if (!mf?.value) continue;
-    const parsed = parseRecipeFromValue(mf.value, mf.type);
-    if (parsed && parsed.length) return parsed;
+    const r = parseRecipeFromValue(mf.value, mf.type, knownVariantIds);
+    if (r.length) return r;
   }
-  return null;
+  return [];
 }
 
-// ---------- public API ----------
-export async function dumpMeta(productId) {
-  const product = await getProduct(productId);
-  const pMfs = await listProductMetafields(productId);
+async function dumpMeta(productId) {
   const variants = await listProductVariants(productId);
-
-  const variantDump = {};
+  const knownIds = new Set(variants.map(v => String(v.id)));
+  const product_metafields = await listProductMetafields(productId);
+  const product_recipe_guess = pickRecipeFromMetafields(product_metafields, knownIds);
+  const variant_metafields = {};
+  const variant_recipes = {};
   for (const v of variants) {
-    const mfs = await listVariantMetafields(v.id);
-    variantDump[String(v.id)] = mfs;
+    const m = await listVariantMetafields(v.id);
+    variant_metafields[v.id] = m;
+    const r = pickRecipeFromMetafields(m, knownIds);
+    variant_recipes[v.id] = r;
   }
-
   return {
     ok: true,
     product_id: String(productId),
-    product_recipe_guess: pickRecipeFromMetafields(pMfs) || [],
-    product_metafields: pMfs,
-    variants: variants.map(v => ({ id: v.id, sku: v.sku || null })),
-    variant_metafields: variantDump
+    product_recipe: product_recipe_guess,
+    variants: variants.map(v => ({ id: v.id })),
+    variant_recipes,
+    product_metafields,
+    variant_metafields
   };
 }
 
-export async function buildBundleMap({ onlyProductId = null, onlyVariantId = null } = {}) {
-  const out = {}; // { "product:ID": [{variantId, qty}], "variant:ID": [...] }
-
-  // Случай: только конкретный вариант — смотрим только его метаполя
+async function buildBundleMap({ onlyProductId = null, onlyVariantId = null } = {}) {
+  const out = {};
   if (onlyVariantId) {
+    const pidRes = await adminFetch(`/variants/${onlyVariantId}.json?fields=product_id`);
+    const pidJson = await pidRes.json();
+    const pid = pidJson?.variant?.product_id;
+    if (!pid) return out;
+    const vars = await listProductVariants(pid);
+    const knownIds = new Set(vars.map(v => String(v.id)));
     const mfs = await listVariantMetafields(onlyVariantId);
-    const recipe = pickRecipeFromMetafields(mfs);
-    if (recipe && recipe.length) {
-      out[`variant:${onlyVariantId}`] = recipe;
-    }
+    const rec = pickRecipeFromMetafields(mfs, knownIds);
+    if (rec.length) out[`variant:${onlyVariantId}`] = rec;
     return out;
   }
-
-  // Случай: конкретный продукт
   if (onlyProductId) {
-    const pMfs = await listProductMetafields(onlyProductId);
-    const pRecipe = pickRecipeFromMetafields(pMfs);
-    if (pRecipe && pRecipe.length) {
-      out[`product:${onlyProductId}`] = pRecipe;
-    }
-
     const vars = await listProductVariants(onlyProductId);
+    const knownIds = new Set(vars.map(v => String(v.id)));
+    const pMfs = await listProductMetafields(onlyProductId);
+    const pRec = pickRecipeFromMetafields(pMfs, knownIds);
+    if (pRec.length) out[`product:${onlyProductId}`] = pRec;
     for (const v of vars) {
       const mfs = await listVariantMetafields(v.id);
-      const r = pickRecipeFromMetafields(mfs);
-      if (r && r.length) {
-        out[`variant:${v.id}`] = r;
-      }
+      const r = pickRecipeFromMetafields(mfs, knownIds);
+      if (r.length) out[`variant:${v.id}`] = r;
     }
     return out;
   }
-
-  // Если нужен полный скан — здесь можно пробежать все продукты магазина,
-  // но это долго и требует пагинации. Оставим узкий путь через product_id/variant_id.
+  const okIds = [];
+  const missIds = [];
+  const products = await listAllProducts();
+  for (const p of products) {
+    const vars = await listProductVariants(p.id);
+    const knownIds = new Set(vars.map(v => String(v.id)));
+    let found = false;
+    const pMfs = await listProductMetafields(p.id);
+    const pRec = pickRecipeFromMetafields(pMfs, knownIds);
+    if (pRec.length) {
+      out[`product:${p.id}`] = pRec;
+      found = true;
+    }
+    for (const v of vars) {
+      const mfs = await listVariantMetafields(v.id);
+      const r = pickRecipeFromMetafields(mfs, knownIds);
+      if (r.length) {
+        out[`variant:${v.id}`] = r;
+        found = true;
+      }
+    }
+    if (found) okIds.push(String(p.id)); else missIds.push(String(p.id));
+  }
+  out["__REPORT_OK"] = okIds;
+  out["__REPORT_MISS"] = missIds;
+  out["__stats"] = { total: products.length, ok: okIds.length, miss: missIds.length };
   return out;
 }
+
+module.exports = {
+  dumpMeta,
+  buildBundleMap
+};
