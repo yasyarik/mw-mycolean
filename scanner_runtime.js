@@ -1,4 +1,4 @@
-// scanner_runtime.js — совместимый с Admin GraphQL без HasMetafieldsIdentifier
+// scanner_runtime.js — скан + дамп метаполей (без HasMetafieldsIdentifier)
 
 const NS_KEYS = [
   ["simple_bundles_2_0","components"],
@@ -53,16 +53,12 @@ async function gqlFetch(body){
   return j;
 }
 
-// собираем блок полей для продукта по alias’ам
 function productMfAliases(){
-  // p_nsX_keyY: metafield(namespace:"...", key:"..."){ value }
   return NS_KEYS.map(([ns,key],i)=>`p_mf_${i}: metafield(namespace:"${ns}", key:"${key}"){ value }`).join('\n');
 }
-// для варианта
 function variantMfAliases(){
   return NS_KEYS.map(([ns,key],i)=>`v_mf_${i}: metafield(namespace:"${ns}", key:"${key}"){ value }`).join('\n');
 }
-
 function firstNonEmptyMetafield(obj, prefix){
   for(let i=0;i<NS_KEYS.length;i++){
     const mf = obj?.[`${prefix}${i}`];
@@ -112,13 +108,10 @@ export async function buildBundleMap({ onlyProductId=null } = {}){
   const map = {};
   for(const p of all){
     const pid = String(p.id).replace(/^gid:\/\/shopify\/Product\//,"");
-
-    // 1) пробуем рецепт на уровне продукта
     const pRaw = firstNonEmptyMetafield(p, "p_mf_");
     const pArr = parseRecipeArray(pRaw);
     if(pArr.length) map[`product:${pid}`] = pArr;
 
-    // 2) пробуем рецепты на уровне вариантов
     const vEdges = p?.variants?.edges || [];
     for(const ve of vEdges){
       const v = ve.node;
@@ -128,6 +121,87 @@ export async function buildBundleMap({ onlyProductId=null } = {}){
       if(vArr.length) map[`variant:${vid}`] = vArr;
     }
   }
-
   return map;
+}
+
+/* === DIAGNOSTICS: полный дамп метаполей через GQL с fallback на REST === */
+
+async function restJson(path){
+  const shop  = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const r = await fetch(`https://${shop}/admin/api/2025-01${path}`,{
+    headers:{ "X-Shopify-Access-Token": token, "Content-Type":"application/json" }
+  });
+  if(!r.ok){
+    const t=await r.text().catch(()=> "");
+    throw new Error(`REST ${path} -> HTTP ${r.status} ${r.statusText} ${t}`);
+  }
+  return r.json();
+}
+
+export async function dumpMeta(productId){
+  const pid = String(productId);
+  const out = { productId: pid, product: [], variants: {} };
+
+  // 1) пытаемся через GraphQL
+  const query = `
+    query DumpMeta($pid:ID!){
+      product(id:$pid){
+        id
+        metafields(first: 200){
+          edges{ node{ namespace key type value } }
+        }
+        variants(first: 200){
+          edges{
+            node{
+              id
+              metafields(first: 200){
+                edges{ node{ namespace key type value } }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+  try{
+    const data = await gqlFetch(gqlBody(query,{ pid: `gid://shopify/Product/${pid}` }));
+    const prod = data?.data?.product;
+    if(prod){
+      const pEdges = prod?.metafields?.edges || [];
+      out.product = pEdges.map(e=>e.node);
+      const vEdges = prod?.variants?.edges || [];
+      for(const ve of vEdges){
+        const vid = String(ve.node.id).replace(/^gid:\/\/shopify\/ProductVariant\//,"");
+        const mEdges = ve?.node?.metafields?.edges || [];
+        out.variants[vid] = mEdges.map(e=>e.node);
+      }
+      return { ok:true, via:"graphql", ...out };
+    }
+  }catch(e){
+    // пойдём REST’ом ниже
+  }
+
+  // 2) fallback: REST
+  try{
+    const p = await restJson(`/products/${pid}.json`);
+    const variants = Array.isArray(p?.product?.variants) ? p.product.variants : [];
+    const pMeta = await restJson(`/products/${pid}/metafields.json`);
+    out.product = Array.isArray(pMeta?.metafields) ? pMeta.metafields.map(m=>({
+      namespace: m.namespace, key: m.key, type: m.type || m.value_type || "", value: String(m.value ?? "")
+    })) : [];
+
+    for(const v of variants){
+      const vid = v.id;
+      try{
+        const vm = await restJson(`/variants/${vid}/metafields.json`);
+        out.variants[String(vid)] = Array.isArray(vm?.metafields) ? vm.metafields.map(m=>({
+          namespace: m.namespace, key: m.key, type: m.type || m.value_type || "", value: String(m.value ?? "")
+        })) : [];
+      }catch(_){}
+    }
+    return { ok:true, via:"rest", ...out };
+  }catch(e){
+    return { ok:false, error: String(e.message||e), ...out };
+  }
 }
