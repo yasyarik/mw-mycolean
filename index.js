@@ -100,8 +100,6 @@ function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
 
-  const json = JSON.stringify(order).toLowerCase();
-
   // --- AfterSell / UpCart detection ---
   for (const li of items) {
     const props = Array.isArray(li.properties) ? li.properties : [];
@@ -135,7 +133,7 @@ function sbDetectFromOrder(order) {
     }
   }
 
-  // --- Simple Bundles / Skio detection ---
+  // --- Simple Bundles / Skio detection через скидки/флаги ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -209,39 +207,18 @@ function remember(e) {
 function getLastOrder() {
   return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
 }
+
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
 
-function isMWOrder(order, conv){
-  try {
+function isSubscription(order){
+  try{
     const items = Array.isArray(order?.line_items) ? order.line_items : [];
-    const origCount = items.length;
-    if (conv && Array.isArray(conv.after) && conv.after.length !== origCount) return true;
-
+    if (items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id)) return true;
     const tags = String(order?.tags || "").toLowerCase();
-    if (tags.includes("simple bundles")) return true;
-
-    const epsilon = 0.00001;
-    const zeroed = (li) => {
-      const da = Array.isArray(li.discount_allocations)
-        ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0)
-        : 0;
-      return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
-    };
-
-    for (const li of items) {
-      if (li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id) return true;
-
-      const props = Array.isArray(li.properties) ? li.properties : [];
-      if (props.some(p => {
-        const n = String(p?.name || "").toLowerCase();
-        return n.includes("_sb_") || n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
-      })) return true;
-
-      if (zeroed(li)) return true;
-    }
-  } catch (_) {}
-  return false;
+    if (tags.includes("subscription")) return true;
+    return false;
+  }catch(_){ return false; }
 }
 
 async function ssRefreshNow(){
@@ -344,19 +321,57 @@ async function getVariantImage(variantId) {
   }
 }
 
+/* -------------------- ДОБАВЛЕНО: рецепт + цена детей -------------------- */
+
+// рецепт из сканера (variant -> product fallback)
+async function fetchBundleRecipe(productId, variantId){
+  try{
+    const mod = await import("./scanner_runtime.js");
+    const map = await mod.buildBundleMap({ onlyProductId: productId ? String(productId) : null });
+    if (variantId && map[`variant:${String(variantId)}`]) return map[`variant:${String(variantId)}`];
+    if (productId && map[`product:${String(productId)}`]) return map[`product:${String(productId)}`];
+    return null;
+  }catch(e){
+    console.error("fetchBundleRecipe via scanner_runtime failed:", e);
+    return null;
+  }
+}
+
+// реальная цена варианта
+async function fetchVariantPrice(variantId){
+  try{
+    const shop = process.env.SHOPIFY_SHOP;
+    const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+    if(!shop || !token || !variantId) return 0;
+    const r = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, {
+      headers: { "X-Shopify-Access-Token": token, "Content-Type":"application/json" }
+    });
+    if(!r.ok) return 0;
+    const j = await r.json();
+    const price = toNum(j?.variant?.price);
+    return price;
+  }catch(_){ return 0; }
+}
+
+/* -------------------- /ДОБАВЛЕНО -------------------- */
+
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
+
   const tags = String(order.tags || "").toLowerCase();
   const anyBundle = sbDetectFromOrder(order);
   const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
+  const sub = isSubscription(order);
 
-  if (!anyBundle && !hasBundleTag) {
-    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
+  // теперь считаем кандидатом всё, что хоть как-то похоже:
+  if (!anyBundle && !hasBundleTag && !sub) {
+    console.log("SKIP ORDER (no bundle/subscription detected):", order.id, order.name);
     return { after: [] };
   }
 
-  const sb = sbDetectFromOrder(order);
+  // 1) если SB/AfterSell что-то нашли — используем как было
+  const sb = anyBundle;
   if (sb) {
     for (const c of sb.children) {
       handled.add(c.id);
@@ -367,6 +382,39 @@ async function transformOrder(order) {
     return { after };
   }
 
+  // 2) ДОБАВЛЕНО: попытаться разложить по рецепту из сканера (вариант/продукт)
+  //    Это работает и для recurring SKIO, где дети не приходят в line_items.
+  let expandedByScanner = false;
+  for (const li of (order.line_items || [])) {
+    try{
+      const comps = await fetchBundleRecipe(li.product_id, li.variant_id);
+      if (Array.isArray(comps) && comps.length) {
+        // помечаем родителя обработанным, детей кладём с реальными ценами и qty*parentQty
+        handled.add(li.id);
+        for (const c of comps) {
+          const unit = await fetchVariantPrice(c.variantId);
+          const qty = (toNum(c.qty || c.quantity || 1)) * (toNum(li.quantity || 1));
+          const imageUrl = await getVariantImage(c.variantId);
+          after.push({
+            id: `${li.id}::${c.variantId}`,
+            title: li.title,
+            sku: li.sku || null,
+            qty: qty,
+            unitPrice: unit,            // реальная цена варианта-ребёнка
+            imageUrl: imageUrl || ""
+          });
+        }
+        expandedByScanner = true;
+      }
+    }catch(e){
+      console.error("scanner expand error:", e);
+    }
+  }
+  if (expandedByScanner) {
+    return { after };
+  }
+
+  // 3) иначе — как и было раньше: просто прокидываем товары как есть
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
@@ -403,13 +451,11 @@ async function handleOrderCreateOrUpdate(req, res) {
       created_at: order.created_at || new Date().toISOString()
     });
     statusById.set(order.id, "awaiting_shipment");
-    if (isMWOrder(order, conv)) {
-  scheduleSSRefresh();
-}
-
+    // триггерим рефреш, если это наш кейс
+    if (conv?.after && conv.after.length) {
+      scheduleSSRefresh();
+    }
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
-
-
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -475,7 +521,7 @@ function minimalXML(o) {
 <Orders>
   <Order>
     <OrderID>${esc(o.id)}</OrderID>
-    <OrderNumber>${esc(o.name.replace(/^#/, ''))}</OrderNumber>
+    <OrderNumber>${esc(String(o.name || "").replace(/^#/, ""))}</OrderNumber>
     <OrderDate>${orderDate}</OrderDate>
     <OrderStatus>${shipStationStatus}</OrderStatus>
     <LastModified>${lastMod}</LastModified>
@@ -582,7 +628,6 @@ app.use("/shipstation", async (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-
 app.get("/health", async (req, res) => {
   try {
     // 1) диагностический дамп: /health?dump=1&product_id=...
@@ -610,15 +655,7 @@ app.get("/health", async (req, res) => {
   }
 });
 
-
-
 const PORT = process.env.PORT || 8080;
-
-
- 
-
-
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
