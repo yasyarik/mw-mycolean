@@ -6,24 +6,26 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
-/* ==================== helpers ==================== */
-
 function hmacOk(raw, header, secret) {
   if (!header || !secret) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
   const a = Buffer.from(header), b = Buffer.from(sig);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
 function toNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : 0;
 }
+
 function esc(x = "") {
   return String(x).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+
 function money2(v) {
   return (Number.isFinite(v) ? v : 0).toFixed(2);
 }
+
 function filledAddress(a) {
   const d = v => (v && String(v).trim()) ? String(v) : "";
   const name = [d(a.first_name), d(a.last_name)].filter(Boolean).join(" ") || "Customer";
@@ -40,11 +42,13 @@ function filledAddress(a) {
     country: (d(a.country_code) || "US").slice(0, 2).toUpperCase()
   };
 }
+
 function skuSafe(i, orderId) {
   const s = (i.sku || "").trim();
   if (s) return s;
   return `MW-${orderId}-${i.id || "ITEM"}`;
 }
+
 function fmtShipDate(d = new Date()) {
   const t = new Date(d);
   const pad = n => String(n).padStart(2, "0");
@@ -56,8 +60,6 @@ function fmtShipDate(d = new Date()) {
   return `${month}/${day}/${year} ${hours}:${minutes}`;
 }
 
-/* ==================== bundle flags ==================== */
-
 function hasParentFlag(li){
   const p = Array.isArray(li?.properties) ? li.properties : [];
   const get = n => p.find(x => x.name === n)?.value;
@@ -66,6 +68,7 @@ function hasParentFlag(li){
   if (get("_bundle") || get("bundle_id")) return true;
   return false;
 }
+
 function bundleKey(li){
   const p = Array.isArray(li?.properties) ? li.properties : [];
   const val = (n) => p.find(x => x.name === n)?.value;
@@ -83,6 +86,7 @@ function bundleKey(li){
   }
   return v ? String(v) : null;
 }
+
 function anyAfterSellKey(li){
   const p = Array.isArray(li?.properties) ? li.properties : [];
   return p.some(x => {
@@ -91,24 +95,28 @@ function anyAfterSellKey(li){
   });
 }
 
-/* ==================== SB detect (как у тебя) ==================== */
-
+// === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   if (!items.length) return null;
 
-  // AfterSell / UpCart JSON в свойствах
+  const json = JSON.stringify(order).toLowerCase();
+
+  // --- AfterSell / UpCart detection ---
   for (const li of items) {
     const props = Array.isArray(li.properties) ? li.properties : [];
     if (!props.length) continue;
+
     const prop = props.find(p => {
       const n = String(p.name || "").toLowerCase();
       return n.includes("aftersell") || n.includes("upcart");
     });
     if (!prop) continue;
+
     try {
       const raw = prop.value;
       if (typeof raw !== "string" || !raw.includes("{")) continue;
+
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length) {
         const children = parsed.map(c => ({
@@ -127,7 +135,7 @@ function sbDetectFromOrder(order) {
     }
   }
 
-  // Simple Bundles / Skio по нулевым скидкам/флагам
+  // --- Simple Bundles / Skio detection ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -168,7 +176,11 @@ function sbDetectFromOrder(order) {
       continue;
     }
   }
-  if (children.size > 0) return { children: Array.from(children) };
+
+  if (children.size > 0) {
+    return { children: Array.from(children) };
+  }
+
   return null;
 }
 
@@ -183,8 +195,6 @@ function pushLine(after, li, imageUrl = "") {
   });
 }
 
-/* ==================== state ==================== */
-
 const history = [];
 const bestById = new Map();
 const statusById = new Map();
@@ -195,24 +205,45 @@ function remember(e) {
   while (history.length > 100) history.shift();
   bestById.set(String(e.id), e);
 }
+
 function getLastOrder() {
   return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
 }
-
-/* ==================== SS refresh ==================== */
-
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
 
-function isSubscription(order){
-  try{
+function isMWOrder(order, conv){
+  try {
     const items = Array.isArray(order?.line_items) ? order.line_items : [];
-    if (items.some(it => it?.selling_plan_id || it?.selling_plan_allocation?.selling_plan_id)) return true;
+    const origCount = items.length;
+    if (conv && Array.isArray(conv.after) && conv.after.length !== origCount) return true;
+
     const tags = String(order?.tags || "").toLowerCase();
-    if (tags.includes("subscription")) return true;
-    return false;
-  }catch(_){ return false; }
+    if (tags.includes("simple bundles")) return true;
+
+    const epsilon = 0.00001;
+    const zeroed = (li) => {
+      const da = Array.isArray(li.discount_allocations)
+        ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0)
+        : 0;
+      return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
+    };
+
+    for (const li of items) {
+      if (li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id) return true;
+
+      const props = Array.isArray(li.properties) ? li.properties : [];
+      if (props.some(p => {
+        const n = String(p?.name || "").toLowerCase();
+        return n.includes("_sb_") || n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
+      })) return true;
+
+      if (zeroed(li)) return true;
+    }
+  } catch (_) {}
+  return false;
 }
+
 async function ssRefreshNow(){
   const id = process.env.SS_STORE_ID;
   const key = process.env.SS_KEY;
@@ -226,6 +257,7 @@ async function ssRefreshNow(){
     });
   } catch (_) {}
 }
+
 function scheduleSSRefresh(){
   const now = Date.now();
   if (now - SS_LAST_REFRESH_AT < 20000) return;
@@ -237,172 +269,105 @@ function scheduleSSRefresh(){
   }, 5000);
 }
 
-/* ==================== Shopify images/prices ==================== */
-
 async function getVariantImage(variantId) {
-  if (!variantId) return "";
+  if (!variantId) {
+    console.log("getVariantImage: NO variant_id");
+    return "";
+  }
   const key = String(variantId);
-  if (variantImageCache.has(key)) return variantImageCache.get(key);
+  if (variantImageCache.has(key)) {
+    const cached = variantImageCache.get(key);
+    console.log(`CACHE HIT variant:${variantId} → ${cached || "EMPTY"}`);
+    return cached;
+  }
 
   const shop = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if (!shop || !token) { variantImageCache.set(key, ""); return ""; }
+
+  if (!shop) {
+    console.log("MISSING SHOPIFY_SHOP in .env");
+    variantImageCache.set(key, "");
+    return "";
+  }
+  if (!token) {
+    console.log("MISSING SHOPIFY_ADMIN_ACCESS_TOKEN in .env");
+    variantImageCache.set(key, "");
+    return "";
+  }
+
+  const url = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
+  console.log(`FETCHING: ${url}`);
 
   try {
-    const res = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, {
+    const res = await fetch(url, {
       headers: { "X-Shopify-Access-Token": token }
     });
-    if (!res.ok) { variantImageCache.set(key, ""); return ""; }
+
+    console.log(`API RESPONSE: ${res.status} ${res.statusText}`);
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.log(`API ERROR BODY: ${errText}`);
+      throw new Error(`HTTP ${res.status}`);
+    }
+
     const data = await res.json();
     const variant = data.variant;
-    let imageUrl = variant?.image?.src || "";
-    if (!imageUrl && variant?.product_id) {
+    if (!variant) {
+      console.log("NO variant in response");
+      variantImageCache.set(key, "");
+      return "";
+    }
+
+    let imageUrl = variant.image?.src || "";
+    console.log(`VARIANT IMAGE: ${imageUrl || "NONE"}`);
+
+    if (!imageUrl && variant.product_id) {
+      console.log(`FALLBACK: fetching product ${variant.product_id}`);
       const prodRes = await fetch(
         `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`,
         { headers: { "X-Shopify-Access-Token": token } }
       );
       if (prodRes.ok) {
         const p = await prodRes.json();
-        imageUrl = p.product?.images?.[0]?.src || "";
+        imageUrl = p.product.images?.[0]?.src || "";
+        console.log(`PRODUCT IMAGE: ${imageUrl || "NONE"}`);
       }
     }
+
     variantImageCache.set(key, imageUrl);
     return imageUrl;
-  } catch {
+  } catch (e) {
+    console.error(`IMAGE FETCH FAILED (variant ${variantId}):`, e.message);
     variantImageCache.set(key, "");
     return "";
   }
 }
-async function fetchVariantPrice(variantId){
-  try{
-    const shop = process.env.SHOPIFY_SHOP;
-    const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-    if(!shop || !token || !variantId) return 0;
-    const r = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, {
-      headers: { "X-Shopify-Access-Token": token, "Content-Type":"application/json" }
-    });
-    if(!r.ok) return 0;
-    const j = await r.json();
-    return toNum(j?.variant?.price);
-  }catch{ return 0; }
-}
-
-/* ==================== MAP из сканера (кэш) ==================== */
-
-let BUNDLE_MAP = {};
-let BUNDLE_MAP_TS = 0;
-const BUNDLE_MAP_TTL_MS = 5 * 60 * 1000; // 5 минут
-
-async function getBundleMap({ onlyProductId = null } = {}) {
-  const now = Date.now();
-  if (!onlyProductId && now - BUNDLE_MAP_TS < BUNDLE_MAP_TTL_MS && BUNDLE_MAP && Object.keys(BUNDLE_MAP).length) {
-    return BUNDLE_MAP;
-  }
-  try {
-    const { buildBundleMap } = await import("./scanner_runtime.js");
-    const map = await buildBundleMap({ onlyProductId });
-    if (!onlyProductId) {
-      BUNDLE_MAP = map || {};
-      BUNDLE_MAP_TS = Date.now();
-    }
-    return map || {};
-  } catch (e) {
-    console.error("buildBundleMap failed:", e.message || e);
-    return BUNDLE_MAP || {};
-  }
-}
-
-async function fetchBundleRecipe(productId, variantId){
-  const keyVar = variantId ? `variant:${String(variantId)}` : null;
-  const keyProd = productId ? `product:${String(productId)}` : null;
-
-  // сначала общий кэш
-  let map = await getBundleMap();
-  if (keyVar && map[keyVar]) return map[keyVar];
-  if (keyProd && map[keyProd]) return map[keyProd];
-
-  // точечный догруз по продукту
-  if (keyProd) {
-    map = await getBundleMap({ onlyProductId: String(productId) });
-    if (keyVar && map[keyVar]) return map[keyVar];
-    if (keyProd && map[keyProd]) return map[keyProd];
-  }
-  return null;
-}
-
-/* ==================== transform ==================== */
 
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
-
   const tags = String(order.tags || "").toLowerCase();
-  const hasBundleTag =
-    tags.includes("simple bundles") ||
-    tags.includes("bundle") ||
-    tags.includes("skio") ||
-    tags.includes("aftersell") ||
-    tags.includes("subscription");
-  const sb = sbDetectFromOrder(order);
+  const anyBundle = sbDetectFromOrder(order);
+  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
 
-  // 1) Если есть нулевые дети/апселлы — добавляем их, НО НЕ ВЫХОДИМ
-  if (sb && Array.isArray(sb.children) && sb.children.length) {
+  if (!anyBundle && !hasBundleTag) {
+    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
+    return { after: [] };
+  }
+
+  const sb = sbDetectFromOrder(order);
+  if (sb) {
     for (const c of sb.children) {
       handled.add(c.id);
       const imageUrl = await getVariantImage(c.variant_id);
       pushLine(after, c, imageUrl);
-      console.log("SB CHILD", {
-        id: c.id,
-        title: c.title,
-        variant_id: c.variant_id,
-        imageUrl: imageUrl ? "OK" : "NO"
-      });
+      console.log("SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
     }
+    return { after };
   }
 
-  // 2) Для каждой ещё не обработанной позиции пробуем рецепт из сканера
-  let expandedByScanner = false;
-  const items = Array.isArray(order.line_items) ? order.line_items : [];
-  for (const li of items) {
-    if (handled.has(li.id)) continue;
-
-    try {
-      const comps = await fetchBundleRecipe(li.product_id, li.variant_id);
-      if (Array.isArray(comps) && comps.length) {
-        handled.add(li.id);
-        const parentQty = toNum(li.quantity || 1);
-
-        for (const c of comps) {
-          const childVid = String(c.variantId || c.variant_id || "");
-          const unit = await fetchVariantPrice(childVid);   // реальная цена варианта
-          const qty = (toNum(c.qty || c.quantity || 1)) * parentQty;
-          const imageUrl = await getVariantImage(childVid);
-
-          after.push({
-            id: `${li.id}::${childVid}`,
-            title: li.title,
-            sku: li.sku || null,
-            qty,
-            unitPrice: unit,
-            imageUrl: imageUrl || ""
-          });
-        }
-
-        expandedByScanner = true;
-        console.log("SCANNER EXPANDED", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id,
-          children: comps.length
-        });
-      }
-    } catch (e) {
-      console.error("scanner expand error:", e);
-    }
-  }
-
-  // 3) Всё, что не обработано — как есть
-  for (const li of items) {
+  for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
     after.push({
@@ -415,17 +380,8 @@ async function transformOrder(order) {
     });
   }
 
-  // Если вообще нет признаков бандла и ничего не разложили, просто вернём как есть
-  if (!after.length && !hasBundleTag && !(sb && sb.children && sb.children.length)) {
-    console.log("SKIP ORDER (no bundle/subscription detected):", order.id, order.name);
-    return { after: [] };
-  }
-
   return { after };
 }
-
-
-/* ==================== webhooks ==================== */
 
 async function handleOrderCreateOrUpdate(req, res) {
   try {
@@ -447,8 +403,13 @@ async function handleOrderCreateOrUpdate(req, res) {
       created_at: order.created_at || new Date().toISOString()
     });
     statusById.set(order.id, "awaiting_shipment");
-    if (conv?.after && conv.after.length) scheduleSSRefresh();
+    if (isMWOrder(order, conv)) {
+  scheduleSSRefresh();
+}
+
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
+
+
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -477,12 +438,11 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
   }
 });
 
-/* ==================== ShipStation endpoint ==================== */
-
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) {
     return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
   }
+
   const items = o.payload.after.map(i => ({
     id: i.id,
     title: i.title,
@@ -491,6 +451,7 @@ function minimalXML(o) {
     unitPrice: i.unitPrice,
     imageUrl: i.imageUrl || ""
   }));
+
   const total = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const bill = filledAddress(o.billing_address || {});
   const ship = filledAddress(o.shipping_address || o.billing_address || {});
@@ -514,7 +475,7 @@ function minimalXML(o) {
 <Orders>
   <Order>
     <OrderID>${esc(o.id)}</OrderID>
-    <OrderNumber>${esc(String(o.name || "").replace(/^#/, ""))}</OrderNumber>
+    <OrderNumber>${esc(o.name.replace(/^#/, ''))}</OrderNumber>
     <OrderDate>${orderDate}</OrderDate>
     <OrderStatus>${shipStationStatus}</OrderStatus>
     <LastModified>${lastMod}</LastModified>
@@ -621,35 +582,16 @@ app.use("/shipstation", async (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-/* ==================== health ==================== */
 
-app.get("/health", async (req, res) => {
-  try {
-    if (req.query && req.query.dump === "1" && req.query.product_id) {
-      const { dumpMeta } = await import("./scanner_runtime.js");
-      const pid = String(req.query.product_id);
-      const data = await dumpMeta(pid);
-      res.set("Content-Type","application/json; charset=utf-8");
-      res.status(200).send(JSON.stringify(data, null, 2));
-      return;
-    }
-    if (req.query && (req.query.scan === "1" || req.query.scan_bundle_map === "1")) {
-      const { buildBundleMap } = await import("./scanner_runtime.js");
-      const productId = req.query.product_id ? String(req.query.product_id) : null;
-      const map = await buildBundleMap({ onlyProductId: productId });
-      res.set("Content-Type","application/json; charset=utf-8");
-      res.status(200).send(JSON.stringify({ ok:true, keys:Object.keys(map).length, map }, null, 2));
-      return;
-    }
-    res.send("ok");
-  } catch (e) {
-    res.status(500).send({ ok:false, error:String(e.message||e) });
-  }
-});
-
-/* ==================== start ==================== */
+app.get("/health", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 8080;
+
+
+ 
+
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
