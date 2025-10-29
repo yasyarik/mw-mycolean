@@ -1,200 +1,154 @@
 const NS_KEYS = [
-  ["simple_bundles_2_0","components"],
-  ["simple_bundles","components"],
-  ["simplebundles","components"],
-  ["bundles","components"],
-  ["sb","components"],
-  ["simple_bundles_2_0","bundle_components"],
-  ["simple_bundles","bundle_components"],
-  ["bundles","bundle_components"],
-  ["simple_bundles_2_0","components_json"],
-  ["simple_bundles","components_json"],
-  ["bundles","components_json"],
-  ["simple_bundles","bundled_variants"]
+  { ns: "simple_bundles_2_0", key: "components" },
+  { ns: "simple_bundles", key: "components" },
+  { ns: "simplebundles", key: "components" },
+  { ns: "bundles", key: "components" }
 ];
 
-function parseRecipeArray(raw){
-  if(!raw) return [];
-  let val = raw;
-  if(typeof val==="string"){
-    const s=val.trim();
-    if((s.startsWith("[")&&s.endsWith("]")) || (s.startsWith("{")&&s.endsWith("}"))){
-      try{ val = JSON.parse(s); }catch{}
+function toStr(x) {
+  return typeof x === "string" ? x : x == null ? "" : String(x);
+}
+
+function parseComponentsValue(val) {
+  if (!val) return [];
+  try {
+    const parsed = JSON.parse(val);
+    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.components) ? parsed.components : [];
+    const out = [];
+    for (const it of list) {
+      const vid = toStr(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//, "");
+      const qty = Number(it.quantity || it.qty || it.qty_each || 0);
+      if (vid && qty > 0) out.push({ variantId: vid, qty });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+async function readVariantComponents(shop, token, variantId) {
+  const url = `https://${shop}/admin/api/2025-01/variants/${variantId}/metafields.json`;
+  const r = await fetch(url, { headers: { "X-Shopify-Access-Token": token } });
+  if (!r.ok) return [];
+  const j = await r.json();
+  const mfs = Array.isArray(j.metafields) ? j.metafields : [];
+  for (const mf of mfs) {
+    const ns = mf.namespace;
+    const key = mf.key;
+    if (NS_KEYS.some(k => k.ns === ns && k.key === key)) {
+      const comps = parseComponentsValue(mf.value);
+      if (comps.length) return comps;
     }
   }
-  const list = Array.isArray(val) ? val : (val && Array.isArray(val.components) ? val.components : []);
-  const out=[];
-  for(const it of list){
-    if(!it) continue;
-    const vid = String(it.variantId || it.variant_id || "").replace(/^gid:\/\/shopify\/ProductVariant\//,"");
-    const qty = Number(it.quantity || it.qty || it.qty_each || it.count || it.quantity_in_bundle || 0);
-    if(vid && qty>0) out.push({ variantId: vid, qty });
+  return [];
+}
+
+async function readProductComponents(shop, token, productId) {
+  const url = `https://${shop}/admin/api/2025-01/products/${productId}/metafields.json`;
+  const r = await fetch(url, { headers: { "X-Shopify-Access-Token": token } });
+  if (!r.ok) return [];
+  const j = await r.json();
+  const mfs = Array.isArray(j.metafields) ? j.metafields : [];
+  for (const mf of mfs) {
+    const ns = mf.namespace;
+    const key = mf.key;
+    if (NS_KEYS.some(k => k.ns === ns && k.key === key)) {
+      const comps = parseComponentsValue(mf.value);
+      if (comps.length) return comps;
+    }
   }
+  return [];
+}
+
+async function listProductsChunk(shop, token, sinceId) {
+  const qs = new URLSearchParams();
+  qs.set("limit", "250");
+  qs.set("fields", "id,variants");
+  if (sinceId) qs.set("since_id", String(sinceId));
+  const url = `https://${shop}/admin/api/2025-01/products.json?${qs.toString()}`;
+  const r = await fetch(url, { headers: { "X-Shopify-Access-Token": token } });
+  if (!r.ok) return { products: [] };
+  const j = await r.json();
+  return { products: Array.isArray(j.products) ? j.products : [] };
+}
+
+export async function buildBundleMap({ onlyProductId = null } = {}) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const out = {};
+  if (!shop || !token) return out;
+
+  async function addVariantRecipe(vid) {
+    const comps = await readVariantComponents(shop, token, vid);
+    if (comps.length) out[`variant:${vid}`] = comps;
+  }
+
+  if (onlyProductId) {
+    const pid = String(onlyProductId);
+    const prodComps = await readProductComponents(shop, token, pid);
+    if (prodComps.length) out[`product:${pid}`] = prodComps;
+
+    const r = await fetch(`https://${shop}/admin/api/2025-01/products/${pid}.json?fields=id,variants`, {
+      headers: { "X-Shopify-Access-Token": token }
+    });
+    if (r.ok) {
+      const j = await r.json();
+      const vars = j?.product?.variants || [];
+      for (const v of vars) {
+        if (v?.id) await addVariantRecipe(String(v.id));
+      }
+    }
+    return out;
+  }
+
+  let since = null;
+  while (true) {
+    const { products } = await listProductsChunk(shop, token, since);
+    if (!products.length) break;
+    for (const p of products) {
+      const pid = String(p.id);
+      const prodComps = await readProductComponents(shop, token, pid);
+      if (prodComps.length) out[`product:${pid}`] = prodComps;
+      const vars = Array.isArray(p.variants) ? p.variants : [];
+      for (const v of vars) {
+        if (v?.id) await addVariantRecipe(String(v.id));
+      }
+      since = p.id;
+    }
+    if (products.length < 250) break;
+  }
+
   return out;
 }
 
-function gqlBody(query, variables){ return JSON.stringify({ query, variables }); }
-
-async function gqlFetch(body){
-  const shop  = process.env.SHOPIFY_SHOP;
+export async function dumpMeta(productId) {
+  const shop = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`,{
-    method:"POST",
-    headers:{ "X-Shopify-Access-Token": token, "Content-Type":"application/json" },
-    body
+  const pid = String(productId || "");
+  if (!shop || !token || !pid) return { ok: false, error: "missing" };
+
+  const prodMfs = await readProductComponents(shop, token, pid);
+  let variants = [];
+  let variantMfs = {};
+  const r = await fetch(`https://${shop}/admin/api/2025-01/products/${pid}.json?fields=id,variants`, {
+    headers: { "X-Shopify-Access-Token": token }
   });
-  if(!r.ok){
-    const t=await r.text().catch(()=> "");
-    throw new Error(`GraphQL HTTP ${r.status} ${r.statusText} ${t}`);
-  }
-  const j = await r.json();
-  if(j.errors) throw new Error(`GraphQL errors: ${JSON.stringify(j.errors).slice(0,500)}`);
-  return j;
-}
-
-function productMfAliases(){
-  return NS_KEYS.map(([ns,key],i)=>`p_mf_${i}: metafield(namespace:"${ns}", key:"${key}"){ value }`).join('\n');
-}
-function variantMfAliases(){
-  return NS_KEYS.map(([ns,key],i)=>`v_mf_${i}: metafield(namespace:"${ns}", key:"${key}"){ value }`).join('\n');
-}
-function firstNonEmptyMetafield(obj, prefix){
-  for(let i=0;i<NS_KEYS.length;i++){
-    const mf = obj?.[`${prefix}${i}`];
-    if(mf && mf.value) return mf.value;
-  }
-  return null;
-}
-
-export async function buildBundleMap({ onlyProductId=null } = {}){
-  const prodMf = productMfAliases();
-  const varMf  = variantMfAliases();
-
-  const query = `
-    query BundleScan($first:Int!, $after:String) {
-      products(first:$first, after:$after${onlyProductId?`, query:"id:${onlyProductId}"`:""}) {
-        edges {
-          cursor
-          node {
-            id
-            ${prodMf}
-            variants(first: 100) {
-              edges {
-                node {
-                  id
-                  sku
-                  ${varMf}
-                }
-              }
-            }
-          }
-        }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-  `;
-
-  const all=[];
-  let after=null;
-  do{
-    const data = await gqlFetch(gqlBody(query,{ first:50, after }));
-    const edges = data?.data?.products?.edges || [];
-    for(const e of edges) all.push(e.node);
-    const pi = data?.data?.products?.pageInfo || {};
-    after = pi?.hasNextPage ? pi.endCursor : null;
-  }while(after);
-
-  const map = {};
-  for(const p of all){
-    const pid = String(p.id).replace(/^gid:\/\/shopify\/Product\//,"");
-    const pRaw = firstNonEmptyMetafield(p, "p_mf_");
-    const pArr = parseRecipeArray(pRaw);
-    if(pArr.length) map[`product:${pid}`] = pArr;
-
-    const vEdges = p?.variants?.edges || [];
-    for(const ve of vEdges){
-      const v = ve.node;
-      const vid = String(v.id).replace(/^gid:\/\/shopify\/ProductVariant\//,"");
-      const vRaw = firstNonEmptyMetafield(v, "v_mf_");
-      const vArr = parseRecipeArray(vRaw);
-      if(vArr.length) map[`variant:${vid}`] = vArr;
+  if (r.ok) {
+    const j = await r.json();
+    variants = j?.product?.variants || [];
+    for (const v of variants) {
+      if (!v?.id) continue;
+      const vid = String(v.id);
+      const comps = await readVariantComponents(shop, token, vid);
+      variantMfs[vid] = comps;
     }
   }
-  return map;
-}
 
-async function restJson(path){
-  const shop  = process.env.SHOPIFY_SHOP;
-  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  const r = await fetch(`https://${shop}/admin/api/2025-01${path}`,{
-    headers:{ "X-Shopify-Access-Token": token, "Content-Type":"application/json" }
-  });
-  if(!r.ok){
-    const t=await r.text().catch(()=> "");
-    throw new Error(`REST ${path} -> HTTP ${r.status} ${r.statusText} ${t}`);
-  }
-  return r.json();
-}
-
-export async function dumpMeta(productId){
-  const pid = String(productId);
-  const out = { productId: pid, product: [], variants: {} };
-
-  const query = `
-    query DumpMeta($pid:ID!){
-      product(id:$pid){
-        id
-        metafields(first: 200){
-          edges{ node{ namespace key type value } }
-        }
-        variants(first: 200){
-          edges{
-            node{
-              id
-              metafields(first: 200){
-                edges{ node{ namespace key type value } }
-              }
-            }
-          }
-        }
-      }
-    }
-  `;
-  try{
-    const data = await gqlFetch(gqlBody(query,{ pid: `gid://shopify/Product/${pid}` }));
-    const prod = data?.data?.product;
-    if(prod){
-      const pEdges = prod?.metafields?.edges || [];
-      out.product = pEdges.map(e=>e.node);
-      const vEdges = prod?.variants?.edges || [];
-      for(const ve of vEdges){
-        const vid = String(ve.node.id).replace(/^gid:\/\/shopify\/ProductVariant\//,"");
-        const mEdges = ve?.node?.metafields?.edges || [];
-        out.variants[vid] = mEdges.map(e=>e.node);
-      }
-      return { ok:true, via:"graphql", ...out };
-    }
-  }catch(e){}
-
-  try{
-    const p = await restJson(`/products/${pid}.json`);
-    const variants = Array.isArray(p?.product?.variants) ? p.product.variants : [];
-    const pMeta = await restJson(`/products/${pid}/metafields.json`);
-    out.product = Array.isArray(pMeta?.metafields) ? pMeta.metafields.map(m=>({
-      namespace: m.namespace, key: m.key, type: m.type || m.value_type || "", value: String(m.value ?? "")
-    })) : [];
-
-    for(const v of variants){
-      const vid = v.id;
-      try{
-        const vm = await restJson(`/variants/${vid}/metafields.json`);
-        out.variants[String(vid)] = Array.isArray(vm?.metafields) ? vm.metafields.map(m=>({
-          namespace: m.namespace, key: m.key, type: m.type || m.value_type || "", value: String(m.value ?? "")
-        })) : [];
-      }catch(_){}
-    }
-    return { ok:true, via:"rest", ...out };
-  }catch(e){
-    return { ok:false, error: String(e.message||e), ...out };
-  }
+  return {
+    ok: true,
+    product_id: pid,
+    product_components: prodMfs,
+    variants: variants.map(v => ({ id: v.id })),
+    variant_components: variantMfs
+  };
 }
