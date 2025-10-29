@@ -11,7 +11,10 @@ const SB_NS_CANDIDATES = [
 const PRODUCT_RECIPE_OVERRIDES = {
   "10345847423286": "10353217306934"
 };
-
+ if (onlyProductId && PRODUCT_OVERRIDE[onlyProductId]) {
+    console.log(`⚙️ Product override: ${onlyProductId} → ${PRODUCT_OVERRIDE[onlyProductId]}`);
+    onlyProductId = PRODUCT_OVERRIDE[onlyProductId];
+  }
 
 function toNum(x){ const n=Number(x); return Number.isFinite(n)?n:0; }
 
