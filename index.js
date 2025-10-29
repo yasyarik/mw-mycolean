@@ -94,16 +94,6 @@ function anyAfterSellKey(li){
     return n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
   });
 }
-function isLikelyBundleParent(li){
-  try {
-    if (hasParentFlag(li)) return true;
-    const s = String(li.sku || "").toLowerCase();
-    const t = String(li.title || li.name || "").toLowerCase();
-    if (s.includes("bundle")) return true;
-    if (t.includes("bundle")) return true;
-    return false;
-  } catch(_) { return false; }
-}
 
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
@@ -357,13 +347,17 @@ async function getVariantImage(variantId) {
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
+  const tags = String(order.tags || "").toLowerCase();
+  const anyBundle = sbDetectFromOrder(order);
+  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
 
-  const items = Array.isArray(order.line_items) ? order.line_items : [];
-  const tags  = String(order.tags || "").toLowerCase();
+  if (!anyBundle && !hasBundleTag) {
+    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
+    return { after: [] };
+  }
 
-  // 1) Пытаемся вытащить детей через текущий детектор (нулевые/aftersell и т.п.)
   const sb = sbDetectFromOrder(order);
-  if (sb && Array.isArray(sb.children) && sb.children.length) {
+  if (sb) {
     for (const c of sb.children) {
       handled.add(c.id);
       const imageUrl = await getVariantImage(c.variant_id);
@@ -373,30 +367,7 @@ async function transformOrder(order) {
     return { after };
   }
 
-  // 2) Если детектор не сработал: эвристика — дропаем «родителя», если он выглядит как bundle,
-  //    а в заказе есть как минимум 2 другие позиции (дети) с ценой >= 0.
-  const parents = items.filter(isLikelyBundleParent);
-  if (parents.length) {
-    const nonParents = items.filter(li => !isLikelyBundleParent(li));
-    // Простое условие: есть родитель И как минимум две "детские" позиции → считаем, что это разложенный бандл.
-    if (nonParents.length >= 2) {
-      for (const li of nonParents) {
-        const imageUrl = await getVariantImage(li.variant_id);
-        after.push({
-          id: li.id,
-          title: li.title,
-          sku: li.sku || null,
-          qty: li.quantity || 1,
-          unitPrice: toNum(li.price),
-          imageUrl
-        });
-      }
-      return { after };
-    }
-  }
-
-  // 3) Иначе — ничего «бандлового» не распознали: отдаем как есть (родители не отфильтровываются).
-  for (const li of items) {
+  for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
     after.push({
@@ -412,6 +383,60 @@ async function transformOrder(order) {
   return { after };
 }
 
+async function handleOrderCreateOrUpdate(req, res) {
+  try {
+    const raw = await getRawBody(req);
+    const hdr = req.headers["x-shopify-hmac-sha256"] || "";
+    if (!hmacOk(raw, hdr, process.env.SHOPIFY_WEBHOOK_SECRET || "")) {
+      res.status(401).send("bad hmac");
+      return;
+    }
+    const order = JSON.parse(raw.toString("utf8"));
+    const conv = await transformOrder(order);
+    remember({
+      id: order.id,
+      name: order.name,
+      email: order.email || "",
+      shipping_address: order.shipping_address || {},
+      billing_address: order.billing_address || {},
+      payload: conv,
+      created_at: order.created_at || new Date().toISOString()
+    });
+    statusById.set(order.id, "awaiting_shipment");
+    if (isMWOrder(order, conv)) {
+  scheduleSSRefresh();
+}
+
+    console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
+
+
+    res.status(200).send("ok");
+  } catch (e) {
+    console.error("Webhook error:", e);
+    res.status(500).send("error");
+  }
+}
+
+app.post("/webhooks/orders-create", handleOrderCreateOrUpdate);
+app.post("/webhooks/orders-updated", handleOrderCreateOrUpdate);
+
+app.post("/webhooks/orders-cancelled", async (req, res) => {
+  try {
+    const raw = await getRawBody(req);
+    const hdr = req.headers["x-shopify-hmac-sha256"] || "";
+    if (!hmacOk(raw, hdr, process.env.SHOPIFY_WEBHOOK_SECRET || "")) {
+      res.status(401).send("bad hmac");
+      return;
+    }
+    const order = JSON.parse(raw.toString("utf8"));
+    statusById.set(order.id, "cancelled");
+    console.log("ORDER CANCELLED", order.id);
+    res.status(200).send("ok");
+  } catch (e) {
+    console.error("Cancel webhook error:", e);
+    res.status(500).send("error");
+  }
+});
 
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) {
@@ -569,3 +594,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
