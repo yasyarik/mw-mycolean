@@ -520,6 +520,7 @@ async function transformOrder(order) {
   const hasBundleTag =
     tags.includes("simple bundles") ||
     tags.includes("bundle") ||
+    tags.includes("upcart") ||
     tags.includes("skio") ||
       tags.includes("subscription") ||
     tags.includes("aftersell");
