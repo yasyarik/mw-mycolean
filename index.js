@@ -232,7 +232,30 @@ function sbDetectFromOrder(order) {
         console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
       }
     }
-    return { children: zeroChildren, subBundleParents };
+        // Собираем названия родительских бандлов по индексам скидок у детей
+    const usedIdx = new Set();
+    for (const ch of zeroChildren) {
+      const das = Array.isArray(ch.discount_allocations) ? ch.discount_allocations : [];
+      for (const d of das) {
+        if (typeof d.discount_application_index === "number") {
+          usedIdx.add(d.discount_application_index);
+        }
+      }
+    }
+    const apps = Array.isArray(order.discount_applications) ? order.discount_applications : [];
+    const bundleTitles = [];
+    for (const i of usedIdx) {
+      const app = apps[i];
+      if (!app || !app.title) continue;
+      // Пример title: "Simple Bundles: TROPICAL TWIST BUNDLE 4 - PACK | ID: 1712…"
+      const t = String(app.title);
+      const m = t.match(/Simple Bundles:\s*([^|]+)/i);
+      const name = (m ? m[1] : t).trim();
+      if (name) bundleTitles.push(name.toLowerCase());
+    }
+
+        return { children: zeroChildren, subBundleParents, bundleTitles };
+
   }
 
   // --- Key/flag grouping (fallback) ---
@@ -554,6 +577,18 @@ async function transformOrder(order) {
           handled.add(li.id);
         }
       }
+            // Дополнительно: если дети найдены по схеме Simple Bundles (zero-priced),
+      // скрываем родителей по точным названиям из discount_applications.
+      if (Array.isArray(sb.bundleTitles) && sb.bundleTitles.length) {
+        const namesSet = new Set(sb.bundleTitles.map(s => s.toLowerCase()));
+        for (const li of (order.line_items || [])) {
+          const titleNorm = String(li.title || "").toLowerCase();
+          if (namesSet.has(titleNorm)) {
+            handled.add(li.id);
+          }
+        }
+      }
+
     }
 
     // 2) Subscription parents without markers: try to expand via scanner; if fail — output the parent itself.
