@@ -559,7 +559,20 @@ async function transformOrder(order) {
 
     // 1) If children are detected — output ONLY children, suppressing explicit parents (flags/markers).
     if (HAS_CHILDREN) {
-           const isLikelyBundleParent = (li) =>
+      for (const c of sb.children) {
+        handled.add(c.id);
+        const imageUrl = await getVariantImage(c.variant_id);
+        pushLine(after, c, imageUrl);
+        console.log(__ORD, "SB CHILD", {
+          id: c.id,
+          title: c.title,
+          variant_id: c.variant_id,
+          imageUrl: imageUrl ? "OK" : "NO"
+        });
+      }
+
+      // Suppress only explicit parent-marked lines (avoid blanket suppression by title substring).
+          const isLikelyBundleParent = (li) =>
         hasParentFlag(li) ||
         bundleKey(li) ||
         (anyAfterSellKey(li) && looksLikeBundle(li));
@@ -571,17 +584,6 @@ async function transformOrder(order) {
         }
       }
 
-      }
-
-      // Suppress only explicit parent-marked lines (avoid blanket suppression by title substring).
-      for (const li of (order.line_items || [])) {
-        if (hasParentFlag(li) || anyAfterSellKey(li) || bundleKey(li)) {
-          handled.add(li.id);
-        }
-      }
-
-
-      
             // Дополнительно: если дети найдены по схеме Simple Bundles (zero-priced),
       // скрываем родителей по точным названиям из discount_applications.
       if (Array.isArray(sb.bundleTitles) && sb.bundleTitles.length) {
