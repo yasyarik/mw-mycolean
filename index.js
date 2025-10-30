@@ -121,9 +121,7 @@ function detectSubBundleNoChildren(order){
 function looksLikeBundle(li) {
   const t = (li.title || "").toLowerCase();
   const s = (li.sku || "").toLowerCase();
-  if (t.includes("bundle") || t.includes("pack") || s.includes("bundle") || s.includes("pack")) return true;
-  const props = Array.isArray(li.properties) ? li.properties : [];
-  return props.some(p => String(p?.name || "").toLowerCase().includes("subscription"));
+  return t.includes("bundle") || t.includes("pack") || s.includes("bundle") || s.includes("pack");
 }
 
 function hasSubUpgradeProp(li) {
@@ -547,9 +545,10 @@ async function transformOrder(order) {
           imageUrl: imageUrl ? "OK" : "NO"
         });
       }
-      for (const li of (order.line_items || [])) {
-  if (looksLikeBundle(li)) handled.add(li.id);
+for (const li of (order.line_items || [])) {
+  if (looksLikeBundle(li) || hasParentFlag(li) || bundleKey(li)) handled.add(li.id);
 }
+
 
     }
 
