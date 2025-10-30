@@ -549,14 +549,11 @@ async function transformOrder(order) {
       }
 
       // Suppress only explicit parent-marked lines (avoid blanket suppression by title substring).
-   for (const li of (order.line_items || [])) {
-  const isParentLike =
-    hasParentFlag(li) ||
-    bundleKey(li) ||
-    (anyAfterSellKey(li) && looksLikeBundle(li)); // suppress only if looks like a parent
-  if (isParentLike) handled.add(li.id);
-}
-
+      for (const li of (order.line_items || [])) {
+        if (hasParentFlag(li) || anyAfterSellKey(li) || bundleKey(li)) {
+          handled.add(li.id);
+        }
+      }
     }
 
     // 2) Subscription parents without markers: try to expand via scanner; if fail — output the parent itself.
