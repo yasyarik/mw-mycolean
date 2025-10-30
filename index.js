@@ -6,6 +6,7 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
+/* === Utils === */
 function hmacOk(raw, header, secret) {
   if (!header || !secret) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -60,7 +61,8 @@ function fmtShipDate(d = new Date()) {
   return `${month}/${day}/${year} ${hours}:${minutes}`;
 }
 
-function hasParentFlag(li) {
+/* === Bundle helpers === */
+function hasParentFlag(li){
   const p = Array.isArray(li?.properties) ? li.properties : [];
   const get = n => p.find(x => x.name === n)?.value;
   if (String(get("_sb_parent")).toLowerCase() === "true") return true;
@@ -69,7 +71,7 @@ function hasParentFlag(li) {
   return false;
 }
 
-function bundleKey(li) {
+function bundleKey(li){
   const p = Array.isArray(li?.properties) ? li.properties : [];
   const val = (n) => p.find(x => x.name === n)?.value;
   let v =
@@ -87,15 +89,22 @@ function bundleKey(li) {
   return v ? String(v) : null;
 }
 
-function anyAfterSellKey(li) {
+function anyAfterSellKey(li){
   const p = Array.isArray(li?.properties) ? li.properties : [];
   return p.some(x => {
-    const n = String(x.name || "").toLowerCase();
-    return n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
+    const n = String(x.name||"").toLowerCase();
+    return n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase") || n.includes("upcart");
   });
 }
 
-function detectSubBundleNoChildren(order) {
+function looksLikeBundle(li) {
+  const t = (li.title || "").toLowerCase();
+  const s = (li.sku || "").toLowerCase();
+  return t.includes("bundle") || t.includes("pack") || s.includes("bundle") || s.includes("pack");
+}
+
+/* Detect a single subscription bundle parent when no children present at all */
+function detectSubBundleNoChildren(order){
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   if (!items.length) return null;
   const tagStr = String(order.tags || "").toLowerCase();
@@ -120,19 +129,13 @@ function detectSubBundleNoChildren(order) {
   return null;
 }
 
-function looksLikeBundle(li) {
-  const t = (li.title || "").toLowerCase();
-  const s = (li.sku || "").toLowerCase();
-  return t.includes("bundle") || t.includes("pack") || s.includes("bundle") || s.includes("pack");
-}
-
 function hasSubUpgradeProp(li) {
   const props = Array.isArray(li.properties) ? li.properties : [];
   return props.some(p => String(p?.name || "").toLowerCase().includes("__upcartsubscriptionupgrade"));
 }
 
 function detectSubBundleParentOnly(order) {
-  // Detect only if sbDetect found no children
+  // Only detect when sbDetect didn't find children
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   if (!items.length) return [];
 
@@ -148,20 +151,35 @@ function detectSubBundleParentOnly(order) {
       id: li.id,
       title: li.title || "",
       sku: li.sku || null,
-      variant_id: li.variant_id || null
+      variant_id: li.variant_id || null,
+      product_id: li.product_id || null,
+      quantity: li.quantity || 1
     });
   }
   return out;
 }
 
-// === SIMPLE BUNDLES DETECT ===
+/* === SIMPLE BUNDLES DETECT ===
+   Returns { children, subBundleParents? } if any. */
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   const __ORD = `[ORDER ${order.id} ${order.name || ''}]`;
 
   if (!items.length) return null;
 
-  // --- AfterSell / UpCart detection from properties JSON payload ---
+  // Pre-calc: subscription bundle parents that have NO explicit child markers
+  const subBundleParents = (Array.isArray(order.line_items) ? order.line_items : []).filter(li => {
+    const label = `${li.sku || ""} ${li.title || ""}`.toLowerCase();
+    const isBundle = /bundle|pack/.test(label);
+    const hasChildMarkers = !!bundleKey(li) || hasParentFlag(li) || anyAfterSellKey(li);
+    const hasSub =
+      String(order.tags || "").toLowerCase().includes("subscription") ||
+      !!li.selling_plan_id ||
+      !!(li.selling_plan_allocation && li.selling_plan_allocation.selling_plan_id);
+    return isBundle && hasSub && !hasChildMarkers;
+  });
+
+  // --- AfterSell / UpCart JSON marker on parent line ---
   for (const li of items) {
     const props = Array.isArray(li.properties) ? li.properties : [];
     if (!props.length) continue;
@@ -187,14 +205,15 @@ function sbDetectFromOrder(order) {
           variant_id: c.variant_id || c.id || null
         }));
         console.log(__ORD, `AfterSell/UpCart bundle detected: ${children.length} children`);
-        return { children, subBundleParents: [] };
+        // We don't return the parent id here; parent suppression will rely on flags later.
+        return { children, subBundleParents };
       }
     } catch (e) {
       console.log(__ORD, "AfterSell/UpCart parse error:", e.message);
     }
   }
 
-  // --- Simple Bundles / Skio detection by "zero-priced" children ---
+  // --- Zero-priced children detection (Simple Bundles / Skio) ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -207,26 +226,16 @@ function sbDetectFromOrder(order) {
   const zeroChildren = items.filter(zeroed);
   const nonZero = items.filter(li => !zeroed(li));
 
-  // Pre-calc: subscription bundle parents without explicit child markers
-  const subBundleParents = (Array.isArray(order.line_items) ? order.line_items : []).filter(li => {
-    const label = `${li.sku || ""} ${li.title || ""}`.toLowerCase();
-    const isBundle = /bundle|pack/.test(label);
-    const hasChildMarkers = !!bundleKey(li) || hasParentFlag(li) || anyAfterSellKey(li);
-    const hasSub =
-      String(order.tags || "").toLowerCase().includes("subscription") ||
-      !!li.selling_plan_id ||
-      !!(li.selling_plan_allocation && li.selling_plan_allocation.selling_plan_id);
-    return isBundle && hasSub && !hasChildMarkers;
-  });
-
-  if (zeroChildren.length && nonZero.length >= 1) {
-    return { children: zeroChildren, subBundleParents };
-  }
-  if (zeroChildren.length && tagStr.includes("simple bundles")) {
+  if ((zeroChildren.length && nonZero.length >= 1) || (zeroChildren.length && tagStr.includes("simple bundles"))) {
+    if (subBundleParents.length) {
+      for (const li of subBundleParents) {
+        console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
+      }
+    }
     return { children: zeroChildren, subBundleParents };
   }
 
-  // Group by bundleKey/flags to infer children when multiple lines share the same group
+  // --- Key/flag grouping (fallback) ---
   const groups = new Map();
   for (const li of items) {
     const k = bundleKey(li);
@@ -240,8 +249,8 @@ function sbDetectFromOrder(order) {
   for (const arr of groups.values()) {
     if (arr.length < 2) continue;
 
-    const hasBundleKeyAll = arr.every(x => !!bundleKey(x));
-    if (hasBundleKeyAll && arr.length >= 2) {
+    const hasBundleKeyForAll = arr.every(x => !!bundleKey(x));
+    if (hasBundleKeyForAll && arr.length >= 2) {
       arr.forEach(li => children.add(li));
       continue;
     }
@@ -251,6 +260,7 @@ function sbDetectFromOrder(order) {
       zeros.forEach(li => children.add(li));
       continue;
     }
+
     if (arr.some(hasParentFlag)) {
       arr.forEach(li => { if (!hasParentFlag(li)) children.add(li); });
       continue;
@@ -264,6 +274,7 @@ function sbDetectFromOrder(order) {
   return null;
 }
 
+/* Push a normalized line */
 function pushLine(after, li, imageUrl = "") {
   after.push({
     id: li.id,
@@ -275,32 +286,11 @@ function pushLine(after, li, imageUrl = "") {
   });
 }
 
+/* === In-memory store === */
 const history = [];
 const bestById = new Map();
 const statusById = new Map();
 const variantImageCache = new Map();
-
-// --- Children dedup helpers (to avoid duplicates across detectors) ---
-function makeChildKey(vid, price, title) {
-  return `${String(vid || "")}||${Number(price) || 0}||${String(title || "")}`;
-}
-function addOrMergeChild(after, bucket, { id, title, sku, qty, unitPrice, imageUrl, variant_id }) {
-  const key = makeChildKey(variant_id, unitPrice, title);
-  if (bucket.has(key)) {
-    const i = bucket.get(key);
-    after[i].qty += Math.max(1, Number(qty || 1));
-    return;
-  }
-  bucket.set(key, after.length);
-  after.push({
-    id,
-    title,
-    sku: (sku || null),
-    qty: Math.max(1, Number(qty || 1)),
-    unitPrice: Number(unitPrice) || 0,
-    imageUrl: imageUrl || ""
-  });
-}
 
 function remember(e) {
   history.push(e);
@@ -312,6 +302,7 @@ function getLastOrder() {
   return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
 }
 
+/* Limit ShipStation refresh calls */
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
 
@@ -332,7 +323,7 @@ async function isInLast10Orders(orderId) {
   }
 }
 
-function isMWOrder(order, conv) {
+function isMWOrder(order, conv){
   try {
     const items = Array.isArray(order?.line_items) ? order.line_items : [];
     const origCount = items.length;
@@ -345,7 +336,7 @@ function isMWOrder(order, conv) {
     const epsilon = 0.00001;
     const zeroed = (li) => {
       const da = Array.isArray(li.discount_allocations)
-        ? li.discount_allocations.reduce((s, d) => s + toNum(d.amount), 0)
+        ? li.discount_allocations.reduce((s,d)=>s+toNum(d.amount),0)
         : 0;
       return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
     };
@@ -365,7 +356,7 @@ function isMWOrder(order, conv) {
   return false;
 }
 
-async function ssRefreshNow() {
+async function ssRefreshNow(){
   const id = process.env.SS_STORE_ID;
   const key = process.env.SS_KEY;
   const sec = process.env.SS_SECRET;
@@ -379,7 +370,7 @@ async function ssRefreshNow() {
   } catch (_) {}
 }
 
-function scheduleSSRefresh() {
+function scheduleSSRefresh(){
   const now = Date.now();
   if (now - SS_LAST_REFRESH_AT < 20000) return;
   if (SS_REFRESH_TIMER) clearTimeout(SS_REFRESH_TIMER);
@@ -411,6 +402,7 @@ function mapSSStatus(o) {
   }
 }
 
+/* Variant helpers (image + basics) */
 async function getVariantImage(variantId) {
   if (!variantId) {
     console.log("getVariantImage: NO variant_id");
@@ -462,10 +454,8 @@ async function getVariantImage(variantId) {
     }
 
     let imageUrl = variant.image?.src || "";
-    console.log(`VARIANT IMAGE: ${imageUrl || "NONE"}`);
 
     if (!imageUrl && variant.product_id) {
-      console.log(`FALLBACK: fetching product ${variant.product_id}`);
       const prodRes = await fetch(
         `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`,
         { headers: { "X-Shopify-Access-Token": token } }
@@ -473,7 +463,6 @@ async function getVariantImage(variantId) {
       if (prodRes.ok) {
         const p = await prodRes.json();
         imageUrl = p.product.images?.[0]?.src || "";
-        console.log(`PRODUCT IMAGE: ${imageUrl || "NONE"}`);
       }
     }
 
@@ -501,6 +490,7 @@ async function getVariantBasics(variantId) {
     let vSKU = (variant?.sku || "").trim() || null;
     let vPrice = toNum(variant?.price);
 
+    // Fallback: resolve "Default Title" to product title
     if ((vTitle || "").toLowerCase() === "default title" && variant?.product_id) {
       try {
         const pr = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=title`, {
@@ -514,22 +504,17 @@ async function getVariantBasics(variantId) {
     }
 
     return { title: vTitle, sku: vSKU, price: vPrice };
-
   } catch {
     return { title: `Variant ${variantId}`, sku: null, price: 0 };
   }
 }
 
+/* === Core transform === */
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
   const tags = String(order.tags || "").toLowerCase();
   const __ORD = `[ORDER ${order.id} ${order.name || ""}]`;
-
-  // Global control flags for hiding parents and merging children
-  let hasAnyChildren = false;
-  const parentHide = new Set();
-  const childMergeBucket = new Map();
 
   const hasBundleTag =
     tags.includes("simple bundles") ||
@@ -547,23 +532,14 @@ async function transformOrder(order) {
   }
 
   if (sb) {
-    const __HAS_SB_CHILDREN__ = Array.isArray(sb.children) && sb.children.length > 0;
+    const HAS_CHILDREN = Array.isArray(sb.children) && sb.children.length > 0;
 
-    // 1) Children directly detected (AfterSell/UpCart JSON, zero-priced, grouped)
-    if (Array.isArray(sb.children)) {
+    // 1) If children are detected — output ONLY children, suppressing explicit parents (flags/markers).
+    if (HAS_CHILDREN) {
       for (const c of sb.children) {
         handled.add(c.id);
         const imageUrl = await getVariantImage(c.variant_id);
-        addOrMergeChild(after, childMergeBucket, {
-          id: c.id,
-          title: c.title,
-          sku: c.sku,
-          qty: c.quantity || 1,
-          unitPrice: toNum(c.price),
-          imageUrl,
-          variant_id: c.variant_id
-        });
-        hasAnyChildren = true;
+        pushLine(after, c, imageUrl);
         console.log(__ORD, "SB CHILD", {
           id: c.id,
           title: c.title,
@@ -571,17 +547,17 @@ async function transformOrder(order) {
           imageUrl: imageUrl ? "OK" : "NO"
         });
       }
-      // Hide any obvious parents when children were found
+
+      // Suppress only explicit parent-marked lines (avoid blanket suppression by title substring).
       for (const li of (order.line_items || [])) {
-        if (looksLikeBundle(li) || hasParentFlag(li) || bundleKey(li)) {
+        if (hasParentFlag(li) || anyAfterSellKey(li) || bundleKey(li)) {
           handled.add(li.id);
-          parentHide.add(li.id);
         }
       }
     }
 
-    // 2) Expand subscription bundle parents via scanner if sbDetect indicated candidates
-    const subParents = __HAS_SB_CHILDREN__ ? [] : (Array.isArray(sb.subBundleParents) ? sb.subBundleParents : []);
+    // 2) Subscription parents without markers: try to expand via scanner; if fail — output the parent itself.
+    const subParents = HAS_CHILDREN ? [] : (Array.isArray(sb.subBundleParents) ? sb.subBundleParents : []);
     for (const li of subParents) {
       try {
         const { buildBundleMap } = await import("./scanner_runtime.js");
@@ -614,33 +590,33 @@ async function transformOrder(order) {
             const vb = await getVariantBasics(vid);
             const imageUrl = await getVariantImage(vid);
 
-            addOrMergeChild(after, childMergeBucket, {
+            after.push({
               id: `${li.id}:${vid}`,
               title: vb.title,
               sku: vb.sku,
               qty: qty * (li.quantity || 1),
               unitPrice: vb.price,
-              imageUrl,
-              variant_id: vid
+              imageUrl
             });
           }
-          handled.add(li.id);
-          parentHide.add(li.id);
-          hasAnyChildren = true;
+          handled.add(li.id); // parent expanded → suppress parent line
         } else {
-          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS", {
-            li_id: li.id,
-            product_id: li.product_id,
-            variant_id: li.variant_id
-          });
+          // Could not resolve children → output the parent itself
+          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS → OUTPUT PARENT");
+          const imageUrl = await getVariantImage(li.variant_id);
+          pushLine(after, li, imageUrl);
+          handled.add(li.id);
         }
       } catch (e) {
-        console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
+        console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e), "→ OUTPUT PARENT");
+        const imageUrl = await getVariantImage(li.variant_id);
+        pushLine(after, li, imageUrl);
+        handled.add(li.id);
       }
     }
   }
 
-  // 3) UpCart/Subscription-upgrade explicit expansion by scanner
+  // 3) UpCart/plan bundle-candidates: expand if possible, else output the parent line itself.
   const ubCandidates = [];
   for (const li of (order.line_items || [])) {
     const props = Array.isArray(li.properties) ? li.properties : [];
@@ -652,6 +628,7 @@ async function transformOrder(order) {
   }
 
   for (const li of ubCandidates) {
+    if (handled.has(li.id)) continue;
     try {
       const { buildBundleMap } = await import("./scanner_runtime.js");
 
@@ -682,38 +659,34 @@ async function transformOrder(order) {
           const vb = await getVariantBasics(vid);
           const imageUrl = await getVariantImage(vid);
 
-          addOrMergeChild(after, childMergeBucket, {
+          after.push({
             id: `${li.id}:${vid}`,
             title: vb.title,
             sku: vb.sku,
             qty: qty * (li.quantity || 1),
             unitPrice: vb.price,
-            imageUrl,
-            variant_id: vid
+            imageUrl
           });
         }
-        handled.add(li.id);
-        parentHide.add(li.id);
-        hasAnyChildren = true;
+        handled.add(li.id); // expanded → suppress parent
       } else {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id
-        });
+        // Could not expand → output parent itself
+        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS → OUTPUT PARENT");
+        const imageUrl = await getVariantImage(li.variant_id);
+        pushLine(after, li, imageUrl);
+        handled.add(li.id);
       }
     } catch (e) {
-      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
+      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e), "→ OUTPUT PARENT");
+      const imageUrl = await getVariantImage(li.variant_id);
+      pushLine(after, li, imageUrl);
+      handled.add(li.id);
     }
   }
 
-  // 4) Final pass-through for any remaining lines
+  // 4) Add all remaining (not handled) lines as-is
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
-    // Hide explicit or likely parents if any children were found
-    if (parentHide.has(li.id)) continue;
-    if (hasAnyChildren && looksLikeBundle(li)) continue;
-
     const imageUrl = await getVariantImage(li.variant_id);
     after.push({
       id: li.id,
@@ -728,6 +701,7 @@ async function transformOrder(order) {
   return { after };
 }
 
+/* === Webhooks === */
 async function handleOrderCreateOrUpdate(req, res) {
   try {
     const raw = await getRawBody(req);
@@ -763,7 +737,6 @@ async function handleOrderCreateOrUpdate(req, res) {
     }
 
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
-
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -792,6 +765,7 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
   }
 });
 
+/* === ShipStation XML feed === */
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) {
     return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
@@ -895,7 +869,7 @@ app.use("/shipstation", async (req, res) => {
         headers: { "X-Shopify-Access-Token": admin }
       });
       if (!r.ok) {
-        const body = await r.text().catch(() => "");
+        const body = await r.text().catch(()=>"");
         res.status(502).send(`<?xml version="1.0" encoding="utf-8"?><Error>Shopify fetch failed ${r.status} ${r.statusText} ${esc(body)}</Error>`);
         return;
       }
@@ -936,6 +910,7 @@ app.use("/shipstation", async (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
+/* Health & debug */
 app.get("/health", async (req, res) => {
   try {
     if (req.query && req.query.dump === "1" && req.query.product_id) {
