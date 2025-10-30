@@ -1,3 +1,4 @@
+
 import express from "express";
 import dotenv from "dotenv";
 import getRawBody from "raw-body";
@@ -95,102 +96,12 @@ function anyAfterSellKey(li){
   });
 }
 
-function detectSubBundleNoChildren(order){
-  const items = Array.isArray(order?.line_items) ? order.line_items : [];
-  if (!items.length) return null;
-  const tagStr = String(order.tags || "").toLowerCase();
-  const sb = sbDetectFromOrder(order);
-  if (sb && Array.isArray(sb.children) && sb.children.length) return null;
-
-  const looksBundle = (li) => {
-    const t = `${li.title || ""} ${li.sku || ""}`.toLowerCase();
-    if (t.includes("bundle") || t.includes("pack")) return true;
-    const props = Array.isArray(li.properties) ? li.properties : [];
-    return props.some(p => {
-      const n = String(p?.name || "").toLowerCase();
-      return n.includes("_sb_") || n.includes("bundle");
-    });
-  };
-
-  const isSubscription = (li) => !!(li.selling_plan_id || li.selling_plan_allocation?.selling_plan_id);
-
-  const parents = items.filter(li => isSubscription(li) && looksBundle(li));
-  if (parents.length === 1 && items.length === 1) return parents[0];
-  if (parents.length === 1 && tagStr.includes("simple bundles")) return parents[0];
-  return null;
-}
-
-// Strict bundle look: by title/sku only (do not infer from properties)
-function looksLikeBundle(li) {
-  const t = (li.title || "").toLowerCase();
-  const s = (li.sku || "").toLowerCase();
-  return t.includes("bundle") || t.includes("pack") || s.includes("bundle") || s.includes("pack");
-}
-
-function hasSubUpgradeProp(li) {
-  const props = Array.isArray(li.properties) ? li.properties : [];
-  return props.some(p => String(p?.name || "").toLowerCase().includes("__upcartsubscriptionupgrade"));
-}
-
-function detectSubBundleParentOnly(order) {
-  // Detect only when sbDetect found no children
-  const items = Array.isArray(order?.line_items) ? order.line_items : [];
-  if (!items.length) return [];
-
-  const tags = String(order?.tags || "").toLowerCase();
-  const isSubscriptionOrder = tags.includes("subscription");
-
-  const out = [];
-  for (const li of items) {
-    const subFlag = isSubscriptionOrder || hasSubUpgradeProp(li) || li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id;
-    if (!subFlag) continue;
-    if (!looksLikeBundle(li)) continue;
-    out.push({
-      id: li.id,
-      title: li.title || "",
-      sku: li.sku || null,
-      variant_id: li.variant_id || null
-    });
-  }
-  return out;
-}
-
 // === SIMPLE BUNDLES DETECT ===
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
-  const __ORD = `[ORDER ${order.id} ${order.name || ''}]`;
-
   if (!items.length) return null;
 
   const json = JSON.stringify(order).toLowerCase();
-
-  // Identify "zero-children" parents from discount application titles (contain "ID: <line_item_id>")
-  function extractZeroParentsFromDiscounts(order) {
-    const out = new Set();
-    const apps = Array.isArray(order.discount_applications) ? order.discount_applications : [];
-    for (const a of apps) {
-      const t = String(a?.title || "");
-      const m = t.match(/ID:\s*(\d{8,})/i);
-      if (m && m[1]) {
-        const lid = m[1];
-        const li = (order.line_items || []).find(x => String(x.id) === lid);
-        if (li) out.add(li.id);
-      }
-    }
-    return Array.from(out);
-  }
-
-  // Pre-calc: subscription bundle parents without explicit children markers
-  const subBundleParents = (Array.isArray(order.line_items) ? order.line_items : []).filter(li => {
-    const label = `${li.sku || ""} ${li.title || ""}`.toLowerCase();
-    const isBundle = /bundle|pack/.test(label);
-    const hasChildMarkers = !!bundleKey(li) || hasParentFlag(li) || anyAfterSellKey(li);
-    const hasSub =
-      String(order.tags || "").toLowerCase().includes("subscription") ||
-      !!li.selling_plan_id ||
-      !!(li.selling_plan_allocation && li.selling_plan_allocation.selling_plan_id);
-    return isBundle && hasSub && !hasChildMarkers;
-  });
 
   // --- AfterSell / UpCart detection ---
   for (const li of items) {
@@ -217,15 +128,15 @@ function sbDetectFromOrder(order) {
           price: toNum(c.price || 0),
           variant_id: c.variant_id || c.id || null
         }));
-        console.log(__ORD, `AfterSell/UpCart bundle detected: ${children.length} children`);
+        console.log(`AfterSell/UpCart bundle detected: ${children.length} children`);
         return { children };
       }
     } catch (e) {
-      console.log(__ORD, "AfterSell/UpCart parse error:", e.message);
+      console.log("AfterSell/UpCart parse error:", e.message);
     }
   }
 
-  // --- Simple Bundles / Skio detection by zero-priced children ---
+  // --- Simple Bundles / Skio detection ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -237,28 +148,13 @@ function sbDetectFromOrder(order) {
 
   const zeroChildren = items.filter(zeroed);
   const nonZero = items.filter(li => !zeroed(li));
-
   if (zeroChildren.length && nonZero.length >= 1) {
-    if (subBundleParents.length) {
-      for (const li of subBundleParents) {
-        console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
-      }
-    }
-    const zeroParents = extractZeroParentsFromDiscounts(order);
-    return { children: zeroChildren, subBundleParents, zeroParents };
+    return { children: zeroChildren };
   }
-
   if (zeroChildren.length && tagStr.includes("simple bundles")) {
-    if (subBundleParents.length) {
-      for (const li of subBundleParents) {
-        console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
-      }
-    }
-    const zeroParents = extractZeroParentsFromDiscounts(order);
-    return { children: zeroChildren, subBundleParents, zeroParents };
+    return { children: zeroChildren };
   }
 
-  // Grouping by bundle keys/flags
   const groups = new Map();
   for (const li of items) {
     const k = bundleKey(li);
@@ -271,13 +167,6 @@ function sbDetectFromOrder(order) {
   const children = new Set();
   for (const arr of groups.values()) {
     if (arr.length < 2) continue;
-
-    const hasBundleKey = arr.every(x => !!bundleKey(x));
-    if (hasBundleKey && arr.length >= 2) {
-      arr.forEach(li => children.add(li));
-      continue;
-    }
-
     const zeros = arr.filter(zeroed);
     if (zeros.length) {
       zeros.forEach(li => children.add(li));
@@ -323,22 +212,6 @@ function getLastOrder() {
 }
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
-async function isInLast10Orders(orderId) {
-  try {
-    const shop = process.env.SHOPIFY_SHOP;
-    const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-    if (!shop || !token) return true;
-    const res = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=30&status=any&order=created_at%20desc&fields=id`, {
-      headers: { "X-Shopify-Access-Token": token }
-    });
-    if (!res.ok) return true;
-    const data = await res.json();
-    const ids = (data.orders || []).map(o => String(o.id));
-    return ids.includes(String(orderId));
-  } catch (_) {
-    return true;
-  }
-}
 
 function isMWOrder(order, conv){
   try {
@@ -347,8 +220,6 @@ function isMWOrder(order, conv){
     if (conv && Array.isArray(conv.after) && conv.after.length !== origCount) return true;
 
     const tags = String(order?.tags || "").toLowerCase();
-    if (tags.includes("subscription")) return true;
-
     if (tags.includes("simple bundles")) return true;
 
     const epsilon = 0.00001;
@@ -397,26 +268,6 @@ function scheduleSSRefresh(){
     await ssRefreshNow();
     SS_LAST_REFRESH_AT = Date.now();
   }, 5000);
-}
-function mapSSStatus(o) {
-  try {
-    if (o.cancelled_at || (o.cancel_reason && String(o.cancel_reason).length)) return "cancelled";
-
-    const tags = String(o.tags || "").toLowerCase();
-    if (tags.includes("on hold") || tags.includes("hold")) return "on_hold";
-
-    const fs = String(o.financial_status || "").toLowerCase();
-    if (fs && fs !== "paid" && fs !== "partially_paid" && fs !== "partially_refunded" && fs !== "refunded") {
-      return "awaiting_payment";
-    }
-
-    const ff = String(o.fulfillment_status || "").toLowerCase();
-    if (ff === "fulfilled" || ff === "shipped") return "shipped";
-
-    return "awaiting_shipment";
-  } catch (_) {
-    return "awaiting_shipment";
-  }
 }
 
 async function getVariantImage(variantId) {
@@ -476,8 +327,8 @@ async function getVariantImage(variantId) {
       console.log(`FALLBACK: fetching product ${variant.product_id}`);
       const prodRes = await fetch(
         `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`,
-        { headers: { "X-Shopify-Access-Token": token }
-      });
+        { headers: { "X-Shopify-Access-Token": token } }
+      );
       if (prodRes.ok) {
         const p = await prodRes.json();
         imageUrl = p.product.images?.[0]?.src || "";
@@ -493,212 +344,30 @@ async function getVariantImage(variantId) {
     return "";
   }
 }
-async function getVariantBasics(variantId) {
-  if (!variantId) return { title: `Variant ${variantId}`, sku: null, price: 0 };
-  const shop = process.env.SHOPIFY_SHOP;
-  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  try {
-    const res = await fetch(`https://${shop}/admin/api/2025-01/variants/${variantId}.json`, {
-      headers: { "X-Shopify-Access-Token": token }
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const { variant } = await res.json();
-    let vTitle = variant?.title || `Variant ${variantId}`;
-    let vSKU = (variant?.sku || "").trim() || null;
-    let vPrice = toNum(variant?.price);
-
-    // Fallback: if variant title is "Default Title" and product_id exists — pull product title
-    if ((vTitle || "").toLowerCase() === "default title" && variant?.product_id) {
-      try {
-        const shop = process.env.SHOPIFY_SHOP;
-        const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-        const pr = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=title`, {
-          headers: { "X-Shopify-Access-Token": token }
-        });
-        if (pr.ok) {
-          const pj = await pr.json();
-          if (pj?.product?.title) vTitle = pj.product.title;
-        }
-      } catch (_) {}
-    }
-
-    return { title: vTitle, sku: vSKU, price: vPrice };
-
-  } catch {
-    return { title: `Variant ${variantId}`, sku: null, price: 0 };
-  }
-}
 
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
   const tags = String(order.tags || "").toLowerCase();
-  const __ORD = `[ORDER ${order.id} ${order.name || ""}]`;
+  const anyBundle = sbDetectFromOrder(order);
+  const hasBundleTag = tags.includes("simple bundles") || tags.includes("bundle") || tags.includes("skio") || tags.includes("aftersell");
 
-  const hasBundleTag =
-    tags.includes("simple bundles") ||
-    tags.includes("bundle") ||
-    tags.includes("upcart") ||
-    tags.includes("skio") ||
-    tags.includes("subscription") ||
-    tags.includes("aftersell");
-
-  const sb = sbDetectFromOrder(order);
-
-  if (!sb && !hasBundleTag) {
-    console.log(__ORD, "SKIP ORDER (no bundle detected)");
+  if (!anyBundle && !hasBundleTag) {
+    console.log("SKIP ORDER (no bundle detected):", order.id, order.name);
     return { after: [] };
   }
 
+  const sb = sbDetectFromOrder(order);
   if (sb) {
-    const __HAS_SB_CHILDREN__ = Array.isArray(sb.children) && sb.children.length > 0;
-
-    // 1) Push detected children; mark only children as handled
-    if (Array.isArray(sb.children)) {
-      for (const c of sb.children) {
-        handled.add(c.id);
-        const imageUrl = await getVariantImage(c.variant_id);
-        pushLine(after, c, imageUrl);
-        console.log(__ORD, "SB CHILD", {
-          id: c.id,
-          title: c.title,
-          variant_id: c.variant_id,
-          imageUrl: imageUrl ? "OK" : "NO"
-        });
-      }
-
-      // Hide only specific zero-parents tied to zero-children (do not hide all bundle-looking lines)
-      if (Array.isArray(sb.zeroParents)) {
-        for (const pid of sb.zeroParents) handled.add(pid);
-      }
+    for (const c of sb.children) {
+      handled.add(c.id);
+      const imageUrl = await getVariantImage(c.variant_id);
+      pushLine(after, c, imageUrl);
+      console.log("SB CHILD", { id: c.id, title: c.title, variant_id: c.variant_id, imageUrl: imageUrl ? "OK" : "NO" });
     }
-
-    // 2) Always try to expand sub-bundle parents via scanner, even if some children already detected elsewhere
-    const subParents = Array.isArray(sb.subBundleParents) ? sb.subBundleParents : [];
-
-    for (const li of subParents) {
-      try {
-        const { buildBundleMap } = await import("./scanner_runtime.js");
-
-        let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-        let kids = map[`product:${li.product_id}`] || [];
-
-        if (!kids.length) {
-          map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-          kids = map[`variant:${li.variant_id}`] || [];
-          if (!kids.length) {
-            const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
-            if (vKeys.length === 1) kids = map[vKeys[0]] || [];
-          }
-        }
-
-        if (kids.length) {
-          console.log(__ORD, "SCANNER EXPAND SUB PARENT", {
-            li_id: li.id,
-            product_id: li.product_id,
-            variant_id: li.variant_id,
-            found_children: kids.length
-          });
-
-          for (const ch of kids) {
-            const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
-            const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
-            if (!vid) continue;
-
-            const vb = await getVariantBasics(vid);
-            const imageUrl = await getVariantImage(vid);
-
-            after.push({
-              id: `${li.id}:${vid}`,
-              title: vb.title,
-              sku: vb.sku,
-              qty: qty * (li.quantity || 1),
-              unitPrice: vb.price,
-              imageUrl
-            });
-          }
-
-          // Mark parent as handled only if kids were actually found
-          handled.add(li.id);
-        } else {
-          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS", {
-            li_id: li.id,
-            product_id: li.product_id,
-            variant_id: li.variant_id
-          });
-          // Do NOT mark parent handled here, so it will pass-through unchanged
-        }
-      } catch (e) {
-        console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
-      }
-    }
+    return { after };
   }
 
-  // UpCart/UB subscription upgrade expansion (mark parent handled only if recipe found)
-  const ubCandidates = [];
-  for (const li of (order.line_items || [])) {
-    const props = Array.isArray(li.properties) ? li.properties : [];
-    const hasUpcartSub = props.some(p => String(p?.name || "").toLowerCase().includes("__upcartsubscriptionupgrade"));
-    const hasPlan = !!(li.selling_plan_id || li.selling_plan_allocation?.selling_plan_id);
-    const isBundleSku = String(li.sku || "").toLowerCase().includes("bundle");
-    const isBundleTitle = String(li.title || "").toLowerCase().includes("bundle");
-    if ((hasUpcartSub || hasPlan) && (isBundleSku || isBundleTitle)) ubCandidates.push(li);
-  }
-
-  for (const li of ubCandidates) {
-    try {
-      const { buildBundleMap } = await import("./scanner_runtime.js");
-
-      let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
-      let recipe = map[`variant:${li.variant_id}`];
-
-      if (!Array.isArray(recipe) || !recipe.length) {
-        map = await buildBundleMap({ onlyProductId: String(li.product_id) });
-        recipe = map[`product:${li.product_id}`];
-        if (!recipe || !recipe.length) {
-          const vKeys = Object.keys(map).filter(k => k.startsWith("variant:"));
-          if (vKeys.length === 1) recipe = map[vKeys[0]] || [];
-        }
-      }
-
-      if (Array.isArray(recipe) && recipe.length) {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id,
-          found_children: recipe.length
-        });
-        for (const r of recipe) {
-          const vid = String(r.variantId || r.variant_id || r.id || "").trim();
-          const qty = Math.max(1, Number(r.qty || r.quantity || 1));
-          if (!vid) continue;
-
-          const vb = await getVariantBasics(vid);
-          const imageUrl = await getVariantImage(vid);
-
-          after.push({
-            id: `${li.id}:${vid}`,
-            title: vb.title,
-            sku: vb.sku,
-            qty: qty * (li.quantity || 1),
-            unitPrice: vb.price,
-            imageUrl
-          });
-        }
-        handled.add(li.id);
-      } else {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS", {
-          li_id: li.id,
-          product_id: li.product_id,
-          variant_id: li.variant_id
-        });
-      }
-    } catch (e) {
-      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
-    }
-  }
-
-  // Final pass-through: any line not handled gets copied as-is (parents without kids + all regular items)
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
@@ -724,14 +393,6 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
-
-    const okRecent = await isInLast10Orders(order.id);
-    if (!okRecent) {
-      console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
-      res.status(200).send("ok");
-      return;
-    }
-
     const conv = await transformOrder(order);
     remember({
       id: order.id,
@@ -740,16 +401,16 @@ async function handleOrderCreateOrUpdate(req, res) {
       shipping_address: order.shipping_address || {},
       billing_address: order.billing_address || {},
       payload: conv,
-      created_at: order.created_at || new Date().toISOString(),
-      _ss_status: mapSSStatus(order)
+      created_at: order.created_at || new Date().toISOString()
     });
-
     statusById.set(order.id, "awaiting_shipment");
     if (isMWOrder(order, conv)) {
-      scheduleSSRefresh();
-    }
+  scheduleSSRefresh();
+}
 
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
+
+
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -798,7 +459,7 @@ function minimalXML(o) {
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
   const lastMod = fmtShipDate(new Date());
-  const shipStationStatus = o._ss_status || "awaiting_shipment";
+  const shipStationStatus = "awaiting_shipment";
 
   const itemsXml = items.map(i => `
     <Item>
@@ -865,48 +526,8 @@ function authOK(req) {
   return false;
 }
 
-app.use("/shipstation", async (req, res) => {
+app.use("/shipstation", (req, res) => {
   res.set("Content-Type", "application/xml; charset=utf-8");
-
-  const checkId = req.query.checkorder_id;
-  if (checkId) {
-    const shop = process.env.SHOPIFY_SHOP;
-    const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-    if (!shop || !admin) {
-      res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Shopify creds missing</Error>`);
-      return;
-    }
-    try {
-      const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(checkId)}.json`, {
-        headers: { "X-Shopify-Access-Token": admin }
-      });
-      if (!r.ok) {
-        const body = await r.text().catch(()=>"");
-        res.status(502).send(`<?xml version="1.0" encoding="utf-8"?><Error>Shopify fetch failed ${r.status} ${r.statusText} ${esc(body)}</Error>`);
-        return;
-      }
-      const data = await r.json();
-      const order = data.order || data;
-      const conv = await transformOrder(order);
-      const shadow = {
-        id: order.id,
-        name: order.name,
-        email: order.email || "",
-        shipping_address: order.shipping_address || {},
-        billing_address: order.billing_address || {},
-        payload: conv,
-        created_at: order.created_at || new Date().toISOString(),
-        _ss_status: mapSSStatus(order) // take fresh status directly from Shopify order
-      };
-      const xml = minimalXML(shadow);
-      res.status(200).send(xml);
-      return;
-
-    } catch (e) {
-      res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Reprocess error</Error>`);
-      return;
-    }
-  }
 
   if (!process.env.SS_USER || !process.env.SS_PASS || !authOK(req)) {
     res.status(401).send(`<?xml version="1.0" encoding="utf-8"?><Error>Authentication failed</Error>`);
@@ -923,34 +544,13 @@ app.use("/shipstation", async (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-app.get("/health", async (req, res) => {
-  try {
-    if (req.query && req.query.dump === "1" && req.query.product_id) {
-      const { dumpMeta } = await import("./scanner_runtime.js");
-      const pid = String(req.query.product_id);
-      const data = await dumpMeta(pid);
-      res.set("Content-Type", "application/json; charset=utf-8");
-      res.status(200).send(JSON.stringify(data, null, 2));
-      return;
-    }
-
-    if (req.query && (req.query.scan === "1" || req.query.scan_bundle_map === "1")) {
-      const { buildBundleMap } = await import("./scanner_runtime.js");
-      const productId = req.query.product_id ? String(req.query.product_id) : null;
-      const variantId = req.query.variant_id ? String(req.query.variant_id) : null;
-      const map = await buildBundleMap({ onlyProductId: productId, onlyVariantId: variantId });
-      res.set("Content-Type", "application/json; charset=utf-8");
-      res.status(200).send(JSON.stringify({ ok: true, keys: Object.keys(map).length, map }, null, 2));
-      return;
-    }
-
-    res.send("ok");
-  } catch (e) {
-    res.status(500).send({ ok: false, error: String(e.message || e) });
-  }
-});
+app.get("/health", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 8080;
+
+
+ 
+
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
