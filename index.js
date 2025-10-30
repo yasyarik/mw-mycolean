@@ -94,6 +94,7 @@ function anyAfterSellKey(li){
     return n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
   });
 }
+
 function detectSubBundleNoChildren(order){
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   if (!items.length) return null;
@@ -118,6 +119,8 @@ function detectSubBundleNoChildren(order){
   if (parents.length === 1 && tagStr.includes("simple bundles")) return parents[0];
   return null;
 }
+
+// Strict bundle look: by title/sku only (do not infer from properties)
 function looksLikeBundle(li) {
   const t = (li.title || "").toLowerCase();
   const s = (li.sku || "").toLowerCase();
@@ -130,7 +133,7 @@ function hasSubUpgradeProp(li) {
 }
 
 function detectSubBundleParentOnly(order) {
-  // Детектируем только если sbDetect не нашёл детей
+  // Detect only when sbDetect found no children
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   if (!items.length) return [];
 
@@ -160,7 +163,24 @@ function sbDetectFromOrder(order) {
   if (!items.length) return null;
 
   const json = JSON.stringify(order).toLowerCase();
-  // Pre-calc: subscription bundle parents without children
+
+  // Identify "zero-children" parents from discount application titles (contain "ID: <line_item_id>")
+  function extractZeroParentsFromDiscounts(order) {
+    const out = new Set();
+    const apps = Array.isArray(order.discount_applications) ? order.discount_applications : [];
+    for (const a of apps) {
+      const t = String(a?.title || "");
+      const m = t.match(/ID:\s*(\d{8,})/i);
+      if (m && m[1]) {
+        const lid = m[1];
+        const li = (order.line_items || []).find(x => String(x.id) === lid);
+        if (li) out.add(li.id);
+      }
+    }
+    return Array.from(out);
+  }
+
+  // Pre-calc: subscription bundle parents without explicit children markers
   const subBundleParents = (Array.isArray(order.line_items) ? order.line_items : []).filter(li => {
     const label = `${li.sku || ""} ${li.title || ""}`.toLowerCase();
     const isBundle = /bundle|pack/.test(label);
@@ -198,16 +218,14 @@ function sbDetectFromOrder(order) {
           variant_id: c.variant_id || c.id || null
         }));
         console.log(__ORD, `AfterSell/UpCart bundle detected: ${children.length} children`);
-
         return { children };
       }
     } catch (e) {
       console.log(__ORD, "AfterSell/UpCart parse error:", e.message);
-
     }
   }
 
-  // --- Simple Bundles / Skio detection ---
+  // --- Simple Bundles / Skio detection by zero-priced children ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -219,27 +237,28 @@ function sbDetectFromOrder(order) {
 
   const zeroChildren = items.filter(zeroed);
   const nonZero = items.filter(li => !zeroed(li));
+
   if (zeroChildren.length && nonZero.length >= 1) {
-        if (subBundleParents.length) {
+    if (subBundleParents.length) {
       for (const li of subBundleParents) {
-console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
-
+        console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
       }
     }
-
-    return { children: zeroChildren, subBundleParents };
+    const zeroParents = extractZeroParentsFromDiscounts(order);
+    return { children: zeroChildren, subBundleParents, zeroParents };
   }
+
   if (zeroChildren.length && tagStr.includes("simple bundles")) {
-        if (subBundleParents.length) {
+    if (subBundleParents.length) {
       for (const li of subBundleParents) {
-console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
-
+        console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
       }
     }
-
-   return { children: zeroChildren, subBundleParents };
+    const zeroParents = extractZeroParentsFromDiscounts(order);
+    return { children: zeroChildren, subBundleParents, zeroParents };
   }
 
+  // Grouping by bundle keys/flags
   const groups = new Map();
   for (const li of items) {
     const k = bundleKey(li);
@@ -252,7 +271,8 @@ console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: 
   const children = new Set();
   for (const arr of groups.values()) {
     if (arr.length < 2) continue;
-        const hasBundleKey = arr.every(x => !!bundleKey(x));
+
+    const hasBundleKey = arr.every(x => !!bundleKey(x));
     if (hasBundleKey && arr.length >= 2) {
       arr.forEach(li => children.add(li));
       continue;
@@ -456,8 +476,8 @@ async function getVariantImage(variantId) {
       console.log(`FALLBACK: fetching product ${variant.product_id}`);
       const prodRes = await fetch(
         `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`,
-        { headers: { "X-Shopify-Access-Token": token } }
-      );
+        { headers: { "X-Shopify-Access-Token": token }
+      });
       if (prodRes.ok) {
         const p = await prodRes.json();
         imageUrl = p.product.images?.[0]?.src || "";
@@ -483,26 +503,26 @@ async function getVariantBasics(variantId) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const { variant } = await res.json();
- let vTitle = variant?.title || `Variant ${variantId}`;
-let vSKU = (variant?.sku || "").trim() || null;
-let vPrice = toNum(variant?.price);
+    let vTitle = variant?.title || `Variant ${variantId}`;
+    let vSKU = (variant?.sku || "").trim() || null;
+    let vPrice = toNum(variant?.price);
 
-// Фолбэк: если вариант называется "Default Title" и есть product_id — подтянем название продукта
-if ((vTitle || "").toLowerCase() === "default title" && variant?.product_id) {
-  try {
-    const shop = process.env.SHOPIFY_SHOP;
-    const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-    const pr = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=title`, {
-      headers: { "X-Shopify-Access-Token": token }
-    });
-    if (pr.ok) {
-      const pj = await pr.json();
-      if (pj?.product?.title) vTitle = pj.product.title;
+    // Fallback: if variant title is "Default Title" and product_id exists — pull product title
+    if ((vTitle || "").toLowerCase() === "default title" && variant?.product_id) {
+      try {
+        const shop = process.env.SHOPIFY_SHOP;
+        const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+        const pr = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=title`, {
+          headers: { "X-Shopify-Access-Token": token }
+        });
+        if (pr.ok) {
+          const pj = await pr.json();
+          if (pj?.product?.title) vTitle = pj.product.title;
+        }
+      } catch (_) {}
     }
-  } catch (_) {}
-}
 
-return { title: vTitle, sku: vSKU, price: vPrice };
+    return { title: vTitle, sku: vSKU, price: vPrice };
 
   } catch {
     return { title: `Variant ${variantId}`, sku: null, price: 0 };
@@ -520,7 +540,7 @@ async function transformOrder(order) {
     tags.includes("bundle") ||
     tags.includes("upcart") ||
     tags.includes("skio") ||
-      tags.includes("subscription") ||
+    tags.includes("subscription") ||
     tags.includes("aftersell");
 
   const sb = sbDetectFromOrder(order);
@@ -533,6 +553,7 @@ async function transformOrder(order) {
   if (sb) {
     const __HAS_SB_CHILDREN__ = Array.isArray(sb.children) && sb.children.length > 0;
 
+    // 1) Push detected children; mark only children as handled
     if (Array.isArray(sb.children)) {
       for (const c of sb.children) {
         handled.add(c.id);
@@ -545,14 +566,15 @@ async function transformOrder(order) {
           imageUrl: imageUrl ? "OK" : "NO"
         });
       }
-for (const li of (order.line_items || [])) {
-  if (looksLikeBundle(li) || hasParentFlag(li) || bundleKey(li)) handled.add(li.id);
-}
 
-
+      // Hide only specific zero-parents tied to zero-children (do not hide all bundle-looking lines)
+      if (Array.isArray(sb.zeroParents)) {
+        for (const pid of sb.zeroParents) handled.add(pid);
+      }
     }
 
- const subParents = __HAS_SB_CHILDREN__ ? [] : (Array.isArray(sb.subBundleParents) ? sb.subBundleParents : []);
+    // 2) Always try to expand sub-bundle parents via scanner, even if some children already detected elsewhere
+    const subParents = Array.isArray(sb.subBundleParents) ? sb.subBundleParents : [];
 
     for (const li of subParents) {
       try {
@@ -595,21 +617,24 @@ for (const li of (order.line_items || [])) {
               imageUrl
             });
           }
+
+          // Mark parent as handled only if kids were actually found
+          handled.add(li.id);
         } else {
           console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS", {
             li_id: li.id,
             product_id: li.product_id,
             variant_id: li.variant_id
           });
+          // Do NOT mark parent handled here, so it will pass-through unchanged
         }
       } catch (e) {
         console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e));
       }
     }
-
-   
   }
 
+  // UpCart/UB subscription upgrade expansion (mark parent handled only if recipe found)
   const ubCandidates = [];
   for (const li of (order.line_items || [])) {
     const props = Array.isArray(li.properties) ? li.properties : [];
@@ -673,6 +698,7 @@ for (const li of (order.line_items || [])) {
     }
   }
 
+  // Final pass-through: any line not handled gets copied as-is (parents without kids + all regular items)
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
@@ -689,7 +715,6 @@ for (const li of (order.line_items || [])) {
   return { after };
 }
 
-
 async function handleOrderCreateOrUpdate(req, res) {
   try {
     const raw = await getRawBody(req);
@@ -699,33 +724,32 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
-  const okRecent = await isInLast10Orders(order.id);
-if (!okRecent) {
-  console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
-  res.status(200).send("ok");
-  return;
-}
 
-const conv = await transformOrder(order);
-remember({
-  id: order.id,
-  name: order.name,
-  email: order.email || "",
-  shipping_address: order.shipping_address || {},
-  billing_address: order.billing_address || {},
-  payload: conv,
-  created_at: order.created_at || new Date().toISOString(),
-  _ss_status: mapSSStatus(order)
-});
+    const okRecent = await isInLast10Orders(order.id);
+    if (!okRecent) {
+      console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
+      res.status(200).send("ok");
+      return;
+    }
+
+    const conv = await transformOrder(order);
+    remember({
+      id: order.id,
+      name: order.name,
+      email: order.email || "",
+      shipping_address: order.shipping_address || {},
+      billing_address: order.billing_address || {},
+      payload: conv,
+      created_at: order.created_at || new Date().toISOString(),
+      _ss_status: mapSSStatus(order)
+    });
 
     statusById.set(order.id, "awaiting_shipment");
     if (isMWOrder(order, conv)) {
-  scheduleSSRefresh();
-}
+      scheduleSSRefresh();
+    }
 
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
-
-
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -774,7 +798,7 @@ function minimalXML(o) {
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
   const lastMod = fmtShipDate(new Date());
- const shipStationStatus = o._ss_status || "awaiting_shipment";
+  const shipStationStatus = o._ss_status || "awaiting_shipment";
 
   const itemsXml = items.map(i => `
     <Item>
@@ -864,22 +888,20 @@ app.use("/shipstation", async (req, res) => {
       const data = await r.json();
       const order = data.order || data;
       const conv = await transformOrder(order);
-    const shadow = {
-  id: order.id,
-  name: order.name,
-  email: order.email || "",
-  shipping_address: order.shipping_address || {},
-  billing_address: order.billing_address || {},
-  payload: conv,
-  created_at: order.created_at || new Date().toISOString(),
-  _ss_status: mapSSStatus(order) // ← статус берём напрямую из свежего Shopify-ордера
-};
-const xml = minimalXML(shadow);
-res.status(200).send(xml);
-return;
+      const shadow = {
+        id: order.id,
+        name: order.name,
+        email: order.email || "",
+        shipping_address: order.shipping_address || {},
+        billing_address: order.billing_address || {},
+        payload: conv,
+        created_at: order.created_at || new Date().toISOString(),
+        _ss_status: mapSSStatus(order) // take fresh status directly from Shopify order
+      };
+      const xml = minimalXML(shadow);
+      res.status(200).send(xml);
+      return;
 
-    
-     
     } catch (e) {
       res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Reprocess error</Error>`);
       return;
@@ -900,7 +922,6 @@ return;
   }
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
-
 
 app.get("/health", async (req, res) => {
   try {
@@ -930,10 +951,6 @@ app.get("/health", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-
-
- 
-
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
