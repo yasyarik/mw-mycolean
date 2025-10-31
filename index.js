@@ -286,66 +286,6 @@ const bestById = new Map();
 const statusById = new Map();
 const variantImageCache = new Map();
 
-const QUEUE = [];
-let QUEUE_RUNNING = false;
-const PENDING_BY_ID = new Map();
-const LAST_TS = new Map();
-
-function tsOf(order) {
-  const s = order?.updated_at || order?.processed_at || order?.created_at;
-  const t = s ? Date.parse(s) : Date.now();
-  return Number.isFinite(t) ? t : Date.now();
-}
-
-function enqueue(order) {
-  const key = String(order.id);
-  PENDING_BY_ID.set(key, order);
-  QUEUE.push(key);
-  runQueue();
-}
-
-async function runQueue() {
-  if (QUEUE_RUNNING) return;
-  QUEUE_RUNNING = true;
-  try {
-    while (QUEUE.length) {
-      const key = QUEUE.shift();
-      const order = PENDING_BY_ID.get(key);
-      if (!order) continue;
-      const curr = PENDING_BY_ID.get(key);
-      if (curr !== order) continue;
-      PENDING_BY_ID.delete(key);
-      const curTs = tsOf(order);
-      const prevTs = LAST_TS.get(key) || 0;
-      if (curTs < prevTs) {
-        console.log("[QUEUE] Skip older", key, curTs, "<", prevTs);
-        continue;
-      }
-      LAST_TS.set(key, curTs);
-      try {
-        const conv = await transformOrder(order);
-        remember({
-          id: order.id,
-          name: order.name,
-          email: order.email || "",
-          shipping_address: order.shipping_address || {},
-          billing_address: order.billing_address || {},
-          payload: conv,
-          created_at: order.created_at || new Date().toISOString(),
-          _ss_status: mapSSStatus(order)
-        });
-        statusById.set(order.id, "awaiting_shipment");
-        if (isMWOrder(order, conv)) scheduleSSRefresh();
-        console.log("[QUEUE] PROCESSED", order.id, "items:", conv.after.length);
-      } catch (e) {
-        console.error("[QUEUE] process error:", e && e.message || e);
-      }
-    }
-  } finally {
-    QUEUE_RUNNING = false;
-  }
-}
-
 function remember(e) {
   history.push(e);
   while (history.length > 100) history.shift();
@@ -543,7 +483,6 @@ async function transformOrder(order) {
   const handled = new Set();
   const tags = String(order.tags || "").toLowerCase();
   const __ORD = `[ORDER ${order.id} ${order.name || ""}]`;
-
   const hasBundleTag =
     tags.includes("simple bundles") ||
     tags.includes("bundle") ||
@@ -561,7 +500,6 @@ async function transformOrder(order) {
 
   if (sb) {
     const HAS_CHILDREN = Array.isArray(sb.children) && sb.children.length > 0;
-
     if (HAS_CHILDREN) {
       for (const c of sb.children) {
         handled.add(c.id);
@@ -574,18 +512,15 @@ async function transformOrder(order) {
           imageUrl: imageUrl ? "OK" : "NO"
         });
       }
-
       const isLikelyBundleParent = (li) =>
         hasParentFlag(li) ||
         bundleKey(li) ||
         (anyAfterSellKey(li) && looksLikeBundle(li));
-
       for (const li of (order.line_items || [])) {
         if (isLikelyBundleParent(li)) {
           handled.add(li.id);
         }
       }
-
       if (Array.isArray(sb.bundleTitles) && sb.bundleTitles.length) {
         const namesSet = new Set(sb.bundleTitles.map(s => s.toLowerCase()));
         for (const li of (order.line_items || [])) {
@@ -596,7 +531,6 @@ async function transformOrder(order) {
         }
       }
     }
-
     const subParents = HAS_CHILDREN ? [] : (Array.isArray(sb.subBundleParents) ? sb.subBundleParents : []);
     for (const li of subParents) {
       try {
@@ -635,7 +569,7 @@ async function transformOrder(order) {
           }
           handled.add(li.id);
         } else {
-          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS → OUTPUT PARENT");
+          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS — OUTPUT PARENT");
           const imageUrl = await getVariantImage(li.variant_id);
           pushLine(after, li, imageUrl);
           handled.add(li.id);
@@ -697,7 +631,7 @@ async function transformOrder(order) {
         }
         handled.add(li.id);
       } else {
-        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS → OUTPUT PARENT");
+        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS — OUTPUT PARENT");
         const imageUrl = await getVariantImage(li.variant_id);
         pushLine(after, li, imageUrl);
         handled.add(li.id);
@@ -735,16 +669,29 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
-
     const okRecent = await isInLast10Orders(order.id);
     if (!okRecent) {
       console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
       res.status(200).send("ok");
       return;
     }
-
-    enqueue(order);
-    res.status(200).send("queued");
+    const conv = await transformOrder(order);
+    remember({
+      id: order.id,
+      name: order.name,
+      email: order.email || "",
+      shipping_address: order.shipping_address || {},
+      billing_address: order.billing_address || {},
+      payload: conv,
+      created_at: order.created_at || new Date().toISOString(),
+      _ss_status: mapSSStatus(order)
+    });
+    statusById.set(order.id, "awaiting_shipment");
+    if (isMWOrder(order, conv)) {
+      scheduleSSRefresh();
+    }
+    console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
+    res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
     res.status(500).send("error");
@@ -763,7 +710,6 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
-    LAST_TS.set(String(order.id), tsOf(order));
     statusById.set(order.id, "cancelled");
     console.log("ORDER CANCELLED", order.id);
     res.status(200).send("ok");
@@ -777,7 +723,6 @@ function minimalXML(o) {
   if (!o || !o.payload?.after?.length) {
     return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
   }
-
   const items = o.payload.after.map(i => ({
     id: i.id,
     title: i.title,
@@ -786,7 +731,6 @@ function minimalXML(o) {
     unitPrice: i.unitPrice,
     imageUrl: i.imageUrl || ""
   }));
-
   const total = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const bill = filledAddress(o.billing_address || {});
   const ship = filledAddress(o.shipping_address || o.billing_address || {});
@@ -794,7 +738,6 @@ function minimalXML(o) {
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
   const lastMod = fmtShipDate(new Date());
   const shipStationStatus = o._ss_status || "awaiting_shipment";
-
   const itemsXml = items.map(i => `
     <Item>
       <LineItemID>${esc(i.id)}</LineItemID>
@@ -805,7 +748,6 @@ function minimalXML(o) {
       <ImageUrl>${esc(i.imageUrl)}</ImageUrl>
       <Adjustment>false</Adjustment>
     </Item>`).join("");
-
   return `<?xml version="1.0" encoding="utf-8"?>
 <Orders>
   <Order>
@@ -851,6 +793,83 @@ function minimalXML(o) {
 </Orders>`;
 }
 
+function minimalOrderNode(o) {
+  const items = (o?.payload?.after || []).map(i => ({
+    id: i.id,
+    title: i.title,
+    sku: i.sku || "",
+    qty: i.qty,
+    unitPrice: i.unitPrice,
+    imageUrl: i.imageUrl || ""
+  }));
+  const total = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
+  const bill = filledAddress(o.billing_address || {});
+  const ship = filledAddress(o.shipping_address || o.billing_address || {});
+  const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
+  const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
+  const lastMod = fmtShipDate(new Date());
+  const shipStationStatus = o._ss_status || "awaiting_shipment";
+  const itemsXml = items.map(i => `
+    <Item>
+      <LineItemID>${esc(i.id)}</LineItemID>
+      <SKU>${esc(skuSafe(i, o.id))}</SKU>
+      <Name>${esc(i.title)}</Name>
+      <Quantity>${i.qty}</Quantity>
+      <UnitPrice>${money2(i.unitPrice)}</UnitPrice>
+      <ImageUrl>${esc(i.imageUrl)}</ImageUrl>
+      <Adjustment>false</Adjustment>
+    </Item>`).join("");
+  return `
+  <Order>
+    <OrderID>${esc(o.id)}</OrderID>
+    <OrderNumber>${esc((o.name || "").replace(/^#/, ''))}</OrderNumber>
+    <OrderDate>${orderDate}</OrderDate>
+    <OrderStatus>${shipStationStatus}</OrderStatus>
+    <LastModified>${lastMod}</LastModified>
+    <ShippingMethod>Ground</ShippingMethod>
+    <PaymentMethod>Other</PaymentMethod>
+    <CurrencyCode>USD</CurrencyCode>
+    <OrderTotal>${money2(total)}</OrderTotal>
+    <TaxAmount>0.00</TaxAmount>
+    <ShippingAmount>0.00</ShippingAmount>
+    <Customer>
+      <CustomerCode>${esc(email)}</CustomerCode>
+      <BillTo>
+        <Name>${esc(bill.name)}</Name>
+        <Company>${esc(bill.company)}</Company>
+        <Phone>${esc(bill.phone)}</Phone>
+        <Email>${esc(email)}</Email>
+        <Address1>${esc(bill.address1)}</Address1>
+        <Address2>${esc(bill.address2)}</Address2>
+        <City>${esc(bill.city)}</City>
+        <State>${esc(bill.state)}</State>
+        <PostalCode>${esc(bill.zip)}</PostalCode>
+        <Country>${esc(bill.country)}</Country>
+      </BillTo>
+      <ShipTo>
+        <Name>${esc(ship.name)}</Name>
+        <Company>${esc(ship.company)}</Company>
+        <Address1>${esc(ship.address1)}</Address1>
+        <Address2>${esc(ship.address2)}</Address2>
+        <City>${esc(ship.city)}</City>
+        <State>${esc(ship.state)}</State>
+        <PostalCode>${esc(ship.zip)}</PostalCode>
+        <Country>${esc(ship.country)}</Country>
+        <Phone>${esc(ship.phone)}</Phone>
+      </ShipTo>
+    </Customer>
+    <Items>${itemsXml}</Items>
+  </Order>`;
+}
+
+function xmlForMany(orders) {
+  if (!Array.isArray(orders) || orders.length === 0) {
+    return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
+  }
+  const body = orders.map(minimalOrderNode).join("\n");
+  return `<?xml version="1.0" encoding="utf-8"?>\n<Orders>\n${body}\n</Orders>`;
+}
+
 function authOK(req) {
   const h = req.headers.authorization || "";
   if (h.startsWith("Basic ")) {
@@ -893,8 +912,7 @@ app.use("/shipstation", async (req, res) => {
         created_at: order.created_at || new Date().toISOString(),
         _ss_status: mapSSStatus(order)
       };
-      const xml = minimalXML(shadow);
-      res.status(200).send(xml);
+      res.status(200).send(xmlForMany([shadow]));
       return;
     } catch (e) {
       res.status(500).send(`<?xml version="1.0" encoding="utf-8"?><Error>Reprocess error</Error>`);
@@ -907,14 +925,40 @@ app.use("/shipstation", async (req, res) => {
     return;
   }
 
-  const id = req.query.order_id;
-  let order;
-  if (id) {
-    order = bestById.get(String(id));
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit || 25)));
+  const sinceStr = String(req.query.since || "").trim();
+  const ids = String(req.query.ids || "").trim();
+
+  let candidates = [];
+
+  if (ids) {
+    const list = ids.split(",").map(s => s.trim()).filter(Boolean);
+    for (const id of list) {
+      const o = bestById.get(String(id));
+      if (o) candidates.push(o);
+    }
   } else {
-    order = getLastOrder();
+    candidates = Array.from(bestById.values());
   }
-  res.send(minimalXML(order || { payload: { after: [] } }));
+
+  candidates.sort((a,b) => {
+    const ta = Date.parse(a?.created_at || "") || 0;
+    const tb = Date.parse(b?.created_at || "") || 0;
+    return tb - ta;
+  });
+
+  if (sinceStr) {
+    const ts = Date.parse(sinceStr);
+    if (Number.isFinite(ts)) {
+      candidates = candidates.filter(o => {
+        const t = Date.parse(o?.created_at || "") || 0;
+        return t >= ts;
+      });
+    }
+  }
+
+  const picked = candidates.slice(0, limit);
+  res.send(xmlForMany(picked));
 });
 
 app.get("/health", async (req, res) => {
@@ -927,7 +971,6 @@ app.get("/health", async (req, res) => {
       res.status(200).send(JSON.stringify(data, null, 2));
       return;
     }
-
     if (req.query && (req.query.scan === "1" || req.query.scan_bundle_map === "1")) {
       const { buildBundleMap } = await import("./scanner_runtime.js");
       const productId = req.query.product_id ? String(req.query.product_id) : null;
@@ -937,7 +980,6 @@ app.get("/health", async (req, res) => {
       res.status(200).send(JSON.stringify({ ok: true, keys: Object.keys(map).length, map }, null, 2));
       return;
     }
-
     res.send("ok");
   } catch (e) {
     res.status(500).send({ ok: false, error: String(e.message || e) });
