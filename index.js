@@ -6,7 +6,6 @@ import crypto from "crypto";
 dotenv.config();
 const app = express();
 
-/* === Utils === */
 function hmacOk(raw, header, secret) {
   if (!header || !secret) return false;
   const sig = crypto.createHmac("sha256", secret).update(raw).digest("base64");
@@ -61,7 +60,6 @@ function fmtShipDate(d = new Date()) {
   return `${month}/${day}/${year} ${hours}:${minutes}`;
 }
 
-/* === Bundle helpers === */
 function hasParentFlag(li){
   const p = Array.isArray(li?.properties) ? li.properties : [];
   const get = n => p.find(x => x.name === n)?.value;
@@ -103,14 +101,12 @@ function looksLikeBundle(li) {
   return t.includes("bundle") || t.includes("pack") || s.includes("bundle") || s.includes("pack");
 }
 
-/* Detect a single subscription bundle parent when no children present at all */
 function detectSubBundleNoChildren(order){
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   if (!items.length) return null;
   const tagStr = String(order.tags || "").toLowerCase();
   const sb = sbDetectFromOrder(order);
   if (sb && Array.isArray(sb.children) && sb.children.length) return null;
-
   const looksBundle = (li) => {
     const t = `${li.title || ""} ${li.sku || ""}`.toLowerCase();
     if (t.includes("bundle") || t.includes("pack")) return true;
@@ -120,9 +116,7 @@ function detectSubBundleNoChildren(order){
       return n.includes("_sb_") || n.includes("bundle");
     });
   };
-
   const isSubscription = (li) => !!(li.selling_plan_id || li.selling_plan_allocation?.selling_plan_id);
-
   const parents = items.filter(li => isSubscription(li) && looksBundle(li));
   if (parents.length === 1 && items.length === 1) return parents[0];
   if (parents.length === 1 && tagStr.includes("simple bundles")) return parents[0];
@@ -135,13 +129,10 @@ function hasSubUpgradeProp(li) {
 }
 
 function detectSubBundleParentOnly(order) {
-  // Only detect when sbDetect didn't find children
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   if (!items.length) return [];
-
   const tags = String(order?.tags || "").toLowerCase();
   const isSubscriptionOrder = tags.includes("subscription");
-
   const out = [];
   for (const li of items) {
     const subFlag = isSubscriptionOrder || hasSubUpgradeProp(li) || li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id;
@@ -159,15 +150,11 @@ function detectSubBundleParentOnly(order) {
   return out;
 }
 
-/* === SIMPLE BUNDLES DETECT ===
-   Returns { children, subBundleParents? } if any. */
 function sbDetectFromOrder(order) {
   const items = Array.isArray(order.line_items) ? order.line_items : [];
   const __ORD = `[ORDER ${order.id} ${order.name || ''}]`;
-
   if (!items.length) return null;
 
-  // Pre-calc: subscription bundle parents that have NO explicit child markers
   const subBundleParents = (Array.isArray(order.line_items) ? order.line_items : []).filter(li => {
     const label = `${li.sku || ""} ${li.title || ""}`.toLowerCase();
     const isBundle = /bundle|pack/.test(label);
@@ -179,21 +166,17 @@ function sbDetectFromOrder(order) {
     return isBundle && hasSub && !hasChildMarkers;
   });
 
-  // --- AfterSell / UpCart JSON marker on parent line ---
   for (const li of items) {
     const props = Array.isArray(li.properties) ? li.properties : [];
     if (!props.length) continue;
-
     const prop = props.find(p => {
       const n = String(p.name || "").toLowerCase();
       return n.includes("aftersell") || n.includes("upcart");
     });
     if (!prop) continue;
-
     try {
       const raw = prop.value;
       if (typeof raw !== "string" || !raw.includes("{")) continue;
-
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length) {
         const children = parsed.map(c => ({
@@ -205,7 +188,6 @@ function sbDetectFromOrder(order) {
           variant_id: c.variant_id || c.id || null
         }));
         console.log(__ORD, `AfterSell/UpCart bundle detected: ${children.length} children`);
-        // We don't return the parent id here; parent suppression will rely on flags later.
         return { children, subBundleParents };
       }
     } catch (e) {
@@ -213,7 +195,6 @@ function sbDetectFromOrder(order) {
     }
   }
 
-  // --- Zero-priced children detection (Simple Bundles / Skio) ---
   const tagStr = String(order.tags || "").toLowerCase();
   const epsilon = 0.00001;
   const zeroed = li => {
@@ -232,7 +213,6 @@ function sbDetectFromOrder(order) {
         console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
       }
     }
-        // Собираем названия родительских бандлов по индексам скидок у детей
     const usedIdx = new Set();
     for (const ch of zeroChildren) {
       const das = Array.isArray(ch.discount_allocations) ? ch.discount_allocations : [];
@@ -247,18 +227,14 @@ function sbDetectFromOrder(order) {
     for (const i of usedIdx) {
       const app = apps[i];
       if (!app || !app.title) continue;
-      // Пример title: "Simple Bundles: TROPICAL TWIST BUNDLE 4 - PACK | ID: 1712…"
       const t = String(app.title);
       const m = t.match(/Simple Bundles:\s*([^|]+)/i);
       const name = (m ? m[1] : t).trim();
       if (name) bundleTitles.push(name.toLowerCase());
     }
-
-        return { children: zeroChildren, subBundleParents, bundleTitles };
-
+    return { children: zeroChildren, subBundleParents, bundleTitles };
   }
 
-  // --- Key/flag grouping (fallback) ---
   const groups = new Map();
   for (const li of items) {
     const k = bundleKey(li);
@@ -271,19 +247,16 @@ function sbDetectFromOrder(order) {
   const children = new Set();
   for (const arr of groups.values()) {
     if (arr.length < 2) continue;
-
     const hasBundleKeyForAll = arr.every(x => !!bundleKey(x));
     if (hasBundleKeyForAll && arr.length >= 2) {
       arr.forEach(li => children.add(li));
       continue;
     }
-
     const zeros = arr.filter(zeroed);
     if (zeros.length) {
       zeros.forEach(li => children.add(li));
       continue;
     }
-
     if (arr.some(hasParentFlag)) {
       arr.forEach(li => { if (!hasParentFlag(li)) children.add(li); });
       continue;
@@ -297,7 +270,6 @@ function sbDetectFromOrder(order) {
   return null;
 }
 
-/* Push a normalized line */
 function pushLine(after, li, imageUrl = "") {
   after.push({
     id: li.id,
@@ -309,11 +281,70 @@ function pushLine(after, li, imageUrl = "") {
   });
 }
 
-/* === In-memory store === */
 const history = [];
 const bestById = new Map();
 const statusById = new Map();
 const variantImageCache = new Map();
+
+const QUEUE = [];
+let QUEUE_RUNNING = false;
+const PENDING_BY_ID = new Map();
+const LAST_TS = new Map();
+
+function tsOf(order) {
+  const s = order?.updated_at || order?.processed_at || order?.created_at;
+  const t = s ? Date.parse(s) : Date.now();
+  return Number.isFinite(t) ? t : Date.now();
+}
+
+function enqueue(order) {
+  const key = String(order.id);
+  PENDING_BY_ID.set(key, order);
+  QUEUE.push(key);
+  runQueue();
+}
+
+async function runQueue() {
+  if (QUEUE_RUNNING) return;
+  QUEUE_RUNNING = true;
+  try {
+    while (QUEUE.length) {
+      const key = QUEUE.shift();
+      const order = PENDING_BY_ID.get(key);
+      if (!order) continue;
+      const curr = PENDING_BY_ID.get(key);
+      if (curr !== order) continue;
+      PENDING_BY_ID.delete(key);
+      const curTs = tsOf(order);
+      const prevTs = LAST_TS.get(key) || 0;
+      if (curTs < prevTs) {
+        console.log("[QUEUE] Skip older", key, curTs, "<", prevTs);
+        continue;
+      }
+      LAST_TS.set(key, curTs);
+      try {
+        const conv = await transformOrder(order);
+        remember({
+          id: order.id,
+          name: order.name,
+          email: order.email || "",
+          shipping_address: order.shipping_address || {},
+          billing_address: order.billing_address || {},
+          payload: conv,
+          created_at: order.created_at || new Date().toISOString(),
+          _ss_status: mapSSStatus(order)
+        });
+        statusById.set(order.id, "awaiting_shipment");
+        if (isMWOrder(order, conv)) scheduleSSRefresh();
+        console.log("[QUEUE] PROCESSED", order.id, "items:", conv.after.length);
+      } catch (e) {
+        console.error("[QUEUE] process error:", e && e.message || e);
+      }
+    }
+  } finally {
+    QUEUE_RUNNING = false;
+  }
+}
 
 function remember(e) {
   history.push(e);
@@ -325,7 +356,6 @@ function getLastOrder() {
   return history.length > 0 ? history[history.length - 1] : [...bestById.values()][bestById.size - 1];
 }
 
-/* Limit ShipStation refresh calls */
 let SS_LAST_REFRESH_AT = 0;
 let SS_REFRESH_TIMER = null;
 
@@ -351,11 +381,9 @@ function isMWOrder(order, conv){
     const items = Array.isArray(order?.line_items) ? order.line_items : [];
     const origCount = items.length;
     if (conv && Array.isArray(conv.after) && conv.after.length !== origCount) return true;
-
     const tags = String(order?.tags || "").toLowerCase();
     if (tags.includes("subscription")) return true;
     if (tags.includes("simple bundles")) return true;
-
     const epsilon = 0.00001;
     const zeroed = (li) => {
       const da = Array.isArray(li.discount_allocations)
@@ -363,16 +391,13 @@ function isMWOrder(order, conv){
         : 0;
       return (da >= toNum(li.price) - epsilon) || (toNum(li.total_discount) >= toNum(li.price) - epsilon);
     };
-
     for (const li of items) {
       if (li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id) return true;
-
       const props = Array.isArray(li.properties) ? li.properties : [];
       if (props.some(p => {
         const n = String(p?.name || "").toLowerCase();
         return n.includes("_sb_") || n.includes("aftersell") || n.includes("after_sell") || n.includes("post_purchase");
       })) return true;
-
       if (zeroed(li)) return true;
     }
   } catch (_) {}
@@ -407,25 +432,20 @@ function scheduleSSRefresh(){
 function mapSSStatus(o) {
   try {
     if (o.cancelled_at || (o.cancel_reason && String(o.cancel_reason).length)) return "cancelled";
-
     const tags = String(o.tags || "").toLowerCase();
     if (tags.includes("on hold") || tags.includes("hold")) return "on_hold";
-
     const fs = String(o.financial_status || "").toLowerCase();
     if (fs && fs !== "paid" && fs !== "partially_paid" && fs !== "partially_refunded" && fs !== "refunded") {
       return "awaiting_payment";
     }
-
     const ff = String(o.fulfillment_status || "").toLowerCase();
     if (ff === "fulfilled" || ff === "shipped") return "shipped";
-
     return "awaiting_shipment";
   } catch (_) {
     return "awaiting_shipment";
   }
 }
 
-/* Variant helpers (image + basics) */
 async function getVariantImage(variantId) {
   if (!variantId) {
     console.log("getVariantImage: NO variant_id");
@@ -437,10 +457,8 @@ async function getVariantImage(variantId) {
     console.log(`CACHE HIT variant:${variantId} → ${cached || "EMPTY"}`);
     return cached;
   }
-
   const shop = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-
   if (!shop) {
     console.log("MISSING SHOPIFY_SHOP in .env");
     variantImageCache.set(key, "");
@@ -451,23 +469,18 @@ async function getVariantImage(variantId) {
     variantImageCache.set(key, "");
     return "";
   }
-
   const url = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
   console.log(`FETCHING: ${url}`);
-
   try {
     const res = await fetch(url, {
       headers: { "X-Shopify-Access-Token": token }
     });
-
     console.log(`API RESPONSE: ${res.status} ${res.statusText}`);
-
     if (!res.ok) {
       const errText = await res.text();
       console.log(`API ERROR BODY: ${errText}`);
       throw new Error(`HTTP ${res.status}`);
     }
-
     const data = await res.json();
     const variant = data.variant;
     if (!variant) {
@@ -475,9 +488,7 @@ async function getVariantImage(variantId) {
       variantImageCache.set(key, "");
       return "";
     }
-
     let imageUrl = variant.image?.src || "";
-
     if (!imageUrl && variant.product_id) {
       const prodRes = await fetch(
         `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=images`,
@@ -488,7 +499,6 @@ async function getVariantImage(variantId) {
         imageUrl = p.product.images?.[0]?.src || "";
       }
     }
-
     variantImageCache.set(key, imageUrl);
     return imageUrl;
   } catch (e) {
@@ -508,12 +518,9 @@ async function getVariantBasics(variantId) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const { variant } = await res.json();
-
     let vTitle = variant?.title || `Variant ${variantId}`;
     let vSKU = (variant?.sku || "").trim() || null;
     let vPrice = toNum(variant?.price);
-
-    // Fallback: resolve "Default Title" to product title
     if ((vTitle || "").toLowerCase() === "default title" && variant?.product_id) {
       try {
         const pr = await fetch(`https://${shop}/admin/api/2025-01/products/${variant.product_id}.json?fields=title`, {
@@ -525,14 +532,12 @@ async function getVariantBasics(variantId) {
         }
       } catch (_) {}
     }
-
     return { title: vTitle, sku: vSKU, price: vPrice };
   } catch {
     return { title: `Variant ${variantId}`, sku: null, price: 0 };
   }
 }
 
-/* === Core transform === */
 async function transformOrder(order) {
   const after = [];
   const handled = new Set();
@@ -557,7 +562,6 @@ async function transformOrder(order) {
   if (sb) {
     const HAS_CHILDREN = Array.isArray(sb.children) && sb.children.length > 0;
 
-    // 1) If children are detected — output ONLY children, suppressing explicit parents (flags/markers).
     if (HAS_CHILDREN) {
       for (const c of sb.children) {
         handled.add(c.id);
@@ -571,8 +575,7 @@ async function transformOrder(order) {
         });
       }
 
-      // Suppress only explicit parent-marked lines (avoid blanket suppression by title substring).
-          const isLikelyBundleParent = (li) =>
+      const isLikelyBundleParent = (li) =>
         hasParentFlag(li) ||
         bundleKey(li) ||
         (anyAfterSellKey(li) && looksLikeBundle(li));
@@ -580,12 +583,9 @@ async function transformOrder(order) {
       for (const li of (order.line_items || [])) {
         if (isLikelyBundleParent(li)) {
           handled.add(li.id);
-          // console.log(__ORD, "SUPPRESS PARENT BY FLAGS", li.id, li.title);
         }
       }
 
-            // Дополнительно: если дети найдены по схеме Simple Bundles (zero-priced),
-      // скрываем родителей по точным названиям из discount_applications.
       if (Array.isArray(sb.bundleTitles) && sb.bundleTitles.length) {
         const namesSet = new Set(sb.bundleTitles.map(s => s.toLowerCase()));
         for (const li of (order.line_items || [])) {
@@ -595,18 +595,14 @@ async function transformOrder(order) {
           }
         }
       }
-
     }
 
-    // 2) Subscription parents without markers: try to expand via scanner; if fail — output the parent itself.
     const subParents = HAS_CHILDREN ? [] : (Array.isArray(sb.subBundleParents) ? sb.subBundleParents : []);
     for (const li of subParents) {
       try {
         const { buildBundleMap } = await import("./scanner_runtime.js");
-
         let map = await buildBundleMap({ onlyProductId: String(li.product_id) });
         let kids = map[`product:${li.product_id}`] || [];
-
         if (!kids.length) {
           map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
           kids = map[`variant:${li.variant_id}`] || [];
@@ -615,7 +611,6 @@ async function transformOrder(order) {
             if (vKeys.length === 1) kids = map[vKeys[0]] || [];
           }
         }
-
         if (kids.length) {
           console.log(__ORD, "SCANNER EXPAND SUB PARENT", {
             li_id: li.id,
@@ -623,15 +618,12 @@ async function transformOrder(order) {
             variant_id: li.variant_id,
             found_children: kids.length
           });
-
           for (const ch of kids) {
             const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
             const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
             if (!vid) continue;
-
             const vb = await getVariantBasics(vid);
             const imageUrl = await getVariantImage(vid);
-
             after.push({
               id: `${li.id}:${vid}`,
               title: vb.title,
@@ -641,9 +633,8 @@ async function transformOrder(order) {
               imageUrl
             });
           }
-          handled.add(li.id); // parent expanded → suppress parent line
+          handled.add(li.id);
         } else {
-          // Could not resolve children → output the parent itself
           console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS → OUTPUT PARENT");
           const imageUrl = await getVariantImage(li.variant_id);
           pushLine(after, li, imageUrl);
@@ -658,7 +649,6 @@ async function transformOrder(order) {
     }
   }
 
-  // 3) UpCart/plan bundle-candidates: expand if possible, else output the parent line itself.
   const ubCandidates = [];
   for (const li of (order.line_items || [])) {
     const props = Array.isArray(li.properties) ? li.properties : [];
@@ -673,10 +663,8 @@ async function transformOrder(order) {
     if (handled.has(li.id)) continue;
     try {
       const { buildBundleMap } = await import("./scanner_runtime.js");
-
       let map = await buildBundleMap({ onlyVariantId: String(li.variant_id) });
       let recipe = map[`variant:${li.variant_id}`];
-
       if (!Array.isArray(recipe) || !recipe.length) {
         map = await buildBundleMap({ onlyProductId: String(li.product_id) });
         recipe = map[`product:${li.product_id}`];
@@ -685,7 +673,6 @@ async function transformOrder(order) {
           if (vKeys.length === 1) recipe = map[vKeys[0]] || [];
         }
       }
-
       if (Array.isArray(recipe) && recipe.length) {
         console.log(__ORD, "SCANNER EXPAND UB PARENT", {
           li_id: li.id,
@@ -697,10 +684,8 @@ async function transformOrder(order) {
           const vid = String(r.variantId || r.variant_id || r.id || "").trim();
           const qty = Math.max(1, Number(r.qty || r.quantity || 1));
           if (!vid) continue;
-
           const vb = await getVariantBasics(vid);
           const imageUrl = await getVariantImage(vid);
-
           after.push({
             id: `${li.id}:${vid}`,
             title: vb.title,
@@ -710,9 +695,8 @@ async function transformOrder(order) {
             imageUrl
           });
         }
-        handled.add(li.id); // expanded → suppress parent
+        handled.add(li.id);
       } else {
-        // Could not expand → output parent itself
         console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS → OUTPUT PARENT");
         const imageUrl = await getVariantImage(li.variant_id);
         pushLine(after, li, imageUrl);
@@ -726,7 +710,6 @@ async function transformOrder(order) {
     }
   }
 
-  // 4) Add all remaining (not handled) lines as-is
   for (const li of (order.line_items || [])) {
     if (handled.has(li.id)) continue;
     const imageUrl = await getVariantImage(li.variant_id);
@@ -743,7 +726,6 @@ async function transformOrder(order) {
   return { after };
 }
 
-/* === Webhooks === */
 async function handleOrderCreateOrUpdate(req, res) {
   try {
     const raw = await getRawBody(req);
@@ -761,25 +743,8 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
 
-    const conv = await transformOrder(order);
-    remember({
-      id: order.id,
-      name: order.name,
-      email: order.email || "",
-      shipping_address: order.shipping_address || {},
-      billing_address: order.billing_address || {},
-      payload: conv,
-      created_at: order.created_at || new Date().toISOString(),
-      _ss_status: mapSSStatus(order)
-    });
-
-    statusById.set(order.id, "awaiting_shipment");
-    if (isMWOrder(order, conv)) {
-      scheduleSSRefresh();
-    }
-
-    console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
-    res.status(200).send("ok");
+    enqueue(order);
+    res.status(200).send("queued");
   } catch (e) {
     console.error("Webhook error:", e);
     res.status(500).send("error");
@@ -798,6 +763,7 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
       return;
     }
     const order = JSON.parse(raw.toString("utf8"));
+    LAST_TS.set(String(order.id), tsOf(order));
     statusById.set(order.id, "cancelled");
     console.log("ORDER CANCELLED", order.id);
     res.status(200).send("ok");
@@ -807,7 +773,6 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
   }
 });
 
-/* === ShipStation XML feed === */
 function minimalXML(o) {
   if (!o || !o.payload?.after?.length) {
     return `<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`;
@@ -952,7 +917,6 @@ app.use("/shipstation", async (req, res) => {
   res.send(minimalXML(order || { payload: { after: [] } }));
 });
 
-/* Health & debug */
 app.get("/health", async (req, res) => {
   try {
     if (req.query && req.query.dump === "1" && req.query.product_id) {
