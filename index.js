@@ -675,6 +675,17 @@ async function handleOrderCreateOrUpdate(req, res) {
       res.status(200).send("ok");
       return;
     }
+    // SKIP non-MW orders entirely: no transform, no remember, no refresh
+if (!isMWOrder(order, null)) {
+  console.log("[ORDER", order.id, order.name || "", "] SKIP: non-MW (no tags/flags)");
+  res.status(200).send("ok");
+  return;
+}
+if (!isMWOrder(order, null)) {
+  res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`);
+  return;
+}
+
     const conv = await transformOrder(order);
     remember({
       id: order.id,
