@@ -324,6 +324,9 @@ function isMWOrder(order, conv){
     const tags = String(order?.tags || "").toLowerCase();
     if (tags.includes("subscription")) return true;
     if (tags.includes("simple bundles")) return true;
+    if (tags.includes("aftersell")) return true;
+if (tags.includes("upcart")) return true;
+if (tags.includes("bundle")) return true;
     const epsilon = 0.00001;
     const zeroed = (li) => {
       const da = Array.isArray(li.discount_allocations)
