@@ -671,13 +671,46 @@ async function handleOrderCreateOrUpdate(req, res) {
       res.status(401).send("bad hmac");
       return;
     }
-    const order = JSON.parse(raw.toString("utf8"));
+    let order = JSON.parse(raw.toString("utf8"));
     const okRecent = await isInLast10Orders(order.id);
     if (!okRecent) {
       console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
       res.status(200).send("ok");
       return;
     }
+        // Ensure tags/properties are present before checks
+    {
+      const tags = String(order.tags || "").toLowerCase();
+      const hasBundleTagExact = /,(simple bundles|bundle|upcart|skio|subscription|aftersell),/.test(`,${tags},`);
+      const hasSubPlan = Array.isArray(order.line_items) && order.line_items.some(li =>
+        li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id
+      );
+      const hasSbProps = Array.isArray(order.line_items) && order.line_items.some(li =>
+        Array.isArray(li.properties) && li.properties.some(p =>
+          String(p?.name || "").toLowerCase().includes("_sb_")
+        )
+      );
+
+      const needRefetch = !(hasBundleTagExact || hasSubPlan || hasSbProps);
+
+      if (needRefetch) {
+        await new Promise(r => setTimeout(r, 1500));
+        const shop = process.env.SHOPIFY_SHOP;
+        const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+        if (shop && admin) {
+          try {
+            const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(order.id)}.json`, {
+              headers: { "X-Shopify-Access-Token": admin }
+            });
+            if (r.ok) {
+              const j = await r.json();
+              if (j?.order) order = j.order;
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
     // SKIP non-MW orders entirely: no transform, no remember, no refresh
 if (!isMWOrder(order, null)) {
   console.log("[ORDER", order.id, order.name || "", "] SKIP: non-MW (no tags/flags)");
