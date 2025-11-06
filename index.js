@@ -959,6 +959,7 @@ app.use("/shipstation", async (req, res) => {
         created_at: order.created_at || new Date().toISOString(),
         _ss_status: mapSSStatus(order)
       };
+      
       res.status(200).send(xmlForMany([shadow]));
       return;
     } catch (e) {
@@ -1030,6 +1031,140 @@ app.get("/health", async (req, res) => {
     res.send("ok");
   } catch (e) {
     res.status(500).send({ ok: false, error: String(e.message || e) });
+  }
+});
+function authAdmin(req) {
+  const key = req.headers["x-admin-key"] || "";
+  return key && process.env.ADMIN_KEY && key === process.env.ADMIN_KEY;
+}
+
+async function ssFetchShipments({ since, page = 1, pageSize = 100, orderNumbers = [] }) {
+  const key = process.env.SS_KEY;
+  const sec = process.env.SS_SECRET;
+  const auth = Buffer.from(`${key}:${sec}`).toString("base64");
+
+  const base = new URL("https://ssapi.shipstation.com/shipments");
+  if (since) base.searchParams.set("shipDateStart", since);
+  base.searchParams.set("page", String(page));
+  base.searchParams.set("pageSize", String(Math.min(500, Math.max(1, pageSize))));
+  // Фильтр по номерам заказов — через includeOrders (перебор ниже)
+  const url = base.toString();
+
+  const res = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+  if (!res.ok) throw new Error(`SS ${res.status}`);
+  const data = await res.json();
+
+  let shipments = Array.isArray(data.shipments) ? data.shipments : [];
+  if (orderNumbers.length) {
+    const set = new Set(orderNumbers.map(s => String(s).trim()));
+    shipments = shipments.filter(s => set.has(String(s.orderNumber)));
+  }
+  return { shipments, pages: data.pages || 1 };
+}
+
+async function shopifyFindOrderByNumber(orderNumber) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const name = `#${orderNumber}`;
+  const url = `https://${shop}/admin/api/2025-01/orders.json?status=any&name=${encodeURIComponent(name)}`;
+  const r = await fetch(url, { headers: { "X-Shopify-Access-Token": token } });
+  if (!r.ok) return null;
+  const j = await r.json();
+  const arr = Array.isArray(j.orders) ? j.orders : [];
+  return arr[0] || null;
+}
+
+function shopifyBuildFulfillmentBody(order, tracking) {
+  const unfulfilled = (Array.isArray(order.line_items) ? order.line_items : []).filter(li => {
+    const fq = Number(li.fulfillable_quantity || 0);
+    return fq > 0;
+  }).map(li => ({ id: li.id, quantity: li.fulfillable_quantity }));
+
+  return {
+    fulfillment: {
+      notify_customer: false,
+      tracking_company: tracking.carrierCode || tracking.carrier || "",
+      tracking_number: tracking.trackingNumber || "",
+      tracking_url: tracking.trackingUrl || tracking.trackingUrlProvider || "",
+      line_items: unfulfilled
+    }
+  };
+}
+
+async function shopifyCreateFulfillment(orderId, body) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const url = `https://${shop}/admin/api/2025-01/orders/${orderId}/fulfillments.json`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(()=>"");
+    throw new Error(`Shopify fulfill err ${r.status} ${t}`);
+  }
+  return r.json();
+}
+
+app.post("/admin/backfill-shipments", express.json(), async (req, res) => {
+  try {
+    if (!authAdmin(req)) {
+      res.status(401).json({ ok: false, error: "unauthorized" });
+      return;
+    }
+    const since = (req.query.since || req.body?.since || "").toString().trim(); // YYYY-MM-DD
+    const orderNumbers = Array.isArray(req.body?.orderNumbers) ? req.body.orderNumbers.map(String) : [];
+
+    if (!since && !orderNumbers.length) {
+      res.status(400).json({ ok: false, error: "provide ?since=YYYY-MM-DD or body.orderNumbers[]" });
+      return;
+    }
+
+    const results = [];
+    let page = 1, pages = 1;
+
+    do {
+      const { shipments, pages: totalPages } = await ssFetchShipments({ since, page, pageSize: 200, orderNumbers });
+      pages = totalPages || 1;
+
+      for (const s of shipments) {
+        try {
+          const so = await shopifyFindOrderByNumber(s.orderNumber);
+          if (!so) {
+            results.push({ orderNumber: s.orderNumber, status: "skip_no_shopify_order" });
+            continue;
+          }
+
+          const ff = String(so.fulfillment_status || "").toLowerCase();
+          const allFulfilled = ff === "fulfilled" || ff === "shipped";
+          const unfulfilledLeft = (Array.isArray(so.line_items) ? so.line_items : []).some(li => Number(li.fulfillable_quantity || 0) > 0);
+
+          if (!unfulfilledLeft || allFulfilled) {
+            results.push({ orderId: so.id, orderNumber: s.orderNumber, status: "already_fulfilled" });
+            continue;
+          }
+
+          const body = shopifyBuildFulfillmentBody(so, {
+            carrierCode: s.carrierCode,
+            carrier: s.carrierCode,
+            trackingNumber: s.trackingNumber,
+            trackingUrl: s.trackingUrl
+          });
+
+          await shopifyCreateFulfillment(so.id, body);
+          results.push({ orderId: so.id, orderNumber: s.orderNumber, status: "fulfilled", tracking: s.trackingNumber });
+        } catch (e) {
+          results.push({ orderNumber: s.orderNumber, status: "error", error: String(e.message || e) });
+        }
+      }
+
+      page += 1;
+    } while (page <= pages);
+
+    res.json({ ok: true, since: since || null, count: results.length, results });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
