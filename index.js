@@ -747,7 +747,7 @@ if (!isMWOrder(order, null)) {
 app.post("/admin/ss-hook", express.json(), async (req, res) => {
   try {
     const sec = req.headers["x-ss-webhook-secret"] || "";
-    if (!process.env.SS_PASS || sec !== process.env.SS_PASS) {
+    if (!process.env.ADMIN_KEY || sec !== process.env.ADMIN_KEY) {
       return res.status(401).json({ ok:false, error:"bad secret" });
     }
 
