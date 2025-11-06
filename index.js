@@ -672,44 +672,50 @@ async function handleOrderCreateOrUpdate(req, res) {
       return;
     }
     let order = JSON.parse(raw.toString("utf8"));
+    const topic = String(req.headers["x-shopify-topic"] || "");
+async function refetchOrderById(id){
+  const shop = process.env.SHOPIFY_SHOP;
+  const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!shop || !admin) return null;
+  const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, { headers: { "X-Shopify-Access-Token": admin } });
+  if (!r.ok) return null;
+  const j = await r.json();
+  return j?.order || null;
+}
+async function refetchWithRetry(id, tries, delayMs){
+  let o = null;
+  for (let i=0;i<tries;i++){
+    o = await refetchOrderById(id);
+    const tags = String(o?.tags || "").toLowerCase();
+    const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
+    const hasPlan = Array.isArray(o?.line_items) && o.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
+    const hasSbProps = Array.isArray(o?.line_items) && o.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
+    if (hasTag || hasPlan || hasSbProps) return o;
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  return o;
+}
+
     const okRecent = await isInLast10Orders(order.id);
     if (!okRecent) {
       console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
       res.status(200).send("ok");
       return;
     }
-        // Ensure tags/properties are present before checks
-    {
-      const tags = String(order.tags || "").toLowerCase();
-      const hasBundleTagExact = /,(simple bundles|bundle|upcart|skio|subscription|aftersell),/.test(`,${tags},`);
-      const hasSubPlan = Array.isArray(order.line_items) && order.line_items.some(li =>
-        li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id
-      );
-      const hasSbProps = Array.isArray(order.line_items) && order.line_items.some(li =>
-        Array.isArray(li.properties) && li.properties.some(p =>
-          String(p?.name || "").toLowerCase().includes("_sb_")
-        )
-      );
+if (topic === "orders/create") {
+  const o2 = await refetchWithRetry(order.id, 3, 1500);
+  if (o2) order = o2;
+} else {
+  const tags = String(order.tags || "").toLowerCase();
+  const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
+  const hasPlan = Array.isArray(order.line_items) && order.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
+  const hasSbProps = Array.isArray(order.line_items) && order.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
+  if (!(hasTag || hasPlan || hasSbProps)) {
+    const o2 = await refetchWithRetry(order.id, 2, 1200);
+    if (o2) order = o2;
+  }
+}
 
-      const needRefetch = !(hasBundleTagExact || hasSubPlan || hasSbProps);
-
-      if (needRefetch) {
-        await new Promise(r => setTimeout(r, 1500));
-        const shop = process.env.SHOPIFY_SHOP;
-        const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-        if (shop && admin) {
-          try {
-            const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(order.id)}.json`, {
-              headers: { "X-Shopify-Access-Token": admin }
-            });
-            if (r.ok) {
-              const j = await r.json();
-              if (j?.order) order = j.order;
-            }
-          } catch (_) {}
-        }
-      }
-    }
 
     // SKIP non-MW orders entirely: no transform, no remember, no refresh
 if (!isMWOrder(order, null)) {
