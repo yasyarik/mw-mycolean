@@ -744,6 +744,52 @@ if (!isMWOrder(order, null)) {
     res.status(500).send("error");
   }
 }
+app.post("/admin/ss-hook", express.json(), async (req, res) => {
+  try {
+    const sec = req.headers["x-ss-webhook-secret"] || "";
+    if (!process.env.SS_PASS || sec !== process.env.SS_PASS) {
+      return res.status(401).json({ ok:false, error:"bad secret" });
+    }
+
+    const b = req.body || {};
+    const orderNumber = String(b.orderNumber || b.order_number || "");
+    const carrierCode = String(b.carrierCode || b.carrier || "");
+    const trackingNumber = String(b.trackingNumber || b.tracking || "");
+    const trackingUrl = String(b.trackingUrl || "");
+
+    if (!orderNumber || !trackingNumber) {
+      return res.status(400).json({ ok:false, error:"missing orderNumber or trackingNumber" });
+    }
+
+    const so = await shopifyFindOrderByNumber(orderNumber);
+    if (!so) return res.status(404).json({ ok:false, error:"shopify order not found" });
+
+    const unfulfilledLeft = (Array.isArray(so.line_items)?so.line_items:[])
+      .some(li => Number(li.fulfillable_quantity||0) > 0);
+
+    if (unfulfilledLeft) {
+      const bodyJson = shopifyBuildFulfillmentBody(so, {
+        carrierCode, trackingNumber, trackingUrl
+      });
+      await shopifyCreateFulfillment(so.id, bodyJson);
+      return res.json({ ok:true, action:"create_fulfillment", orderId: so.id });
+    } else {
+      const listUrl = `https://${process.env.SHOPIFY_SHOP}/admin/api/2025-01/fulfillments.json?order_id=${so.id}`;
+      const r = await fetch(listUrl, { headers:{ "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN }});
+      const j = await r.json();
+      const ff = (j.fulfillments||[]).filter(x => (x.status||"")!=="cancelled").pop();
+      if (ff && ff.id) {
+        const upd = { fulfillment:{ notify_customer:false, tracking_info:{ number:trackingNumber, url:trackingUrl||null, company:carrierCode||null } } };
+        const u = `https://${process.env.SHOPIFY_SHOP}/admin/api/2025-01/fulfillments/${ff.id}/update_tracking.json`;
+        await fetch(u, { method:"POST", headers:{ "X-Shopify-Access-Token":process.env.SHOPIFY_ADMIN_ACCESS_TOKEN, "Content-Type":"application/json" }, body: JSON.stringify(upd) });
+        return res.json({ ok:true, action:"update_tracking", orderId: so.id, fulfillmentId: ff.id });
+      }
+      return res.json({ ok:true, action:"noop_no_open_and_no_ff", orderId: so.id });
+    }
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e.message||e) });
+  }
+});
 
 app.post("/webhooks/orders-create", handleOrderCreateOrUpdate);
 app.post("/webhooks/orders-updated", handleOrderCreateOrUpdate);
