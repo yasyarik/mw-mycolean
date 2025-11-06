@@ -304,7 +304,7 @@ async function isInLast10Orders(orderId) {
     const shop = process.env.SHOPIFY_SHOP;
     const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
     if (!shop || !token) return true;
-    const res = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=550&status=any&order=created_at%20desc&fields=id`, {
+    const res = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=50&status=any&order=created_at%20desc&fields=id`, {
       headers: { "X-Shopify-Access-Token": token }
     });
     if (!res.ok) return true;
