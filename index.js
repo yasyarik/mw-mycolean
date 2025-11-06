@@ -1039,8 +1039,9 @@ function authAdmin(req) {
 }
 
 async function ssFetchShipments({ since, page = 1, pageSize = 100, orderNumbers = [] }) {
-  const key = process.env.SS_KEY;
-  const sec = process.env.SS_SECRET;
+  const key = process.env.SS_KEY || process.env.SS_V2_KEY;
+const sec = process.env.SS_SECRET || process.env.SS_V2_SECRET;
+
   const auth = Buffer.from(`${key}:${sec}`).toString("base64");
 
   const base = new URL("https://ssapi.shipstation.com/shipments");
