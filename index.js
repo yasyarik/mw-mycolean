@@ -717,10 +717,7 @@ if (!isMWOrder(order, null)) {
   res.status(200).send("ok");
   return;
 }
-if (!isMWOrder(order, null)) {
-  res.status(200).send(`<?xml version="1.0" encoding="utf-8"?><Orders></Orders>`);
-  return;
-}
+
 
     const conv = await transformOrder(order);
     remember({
@@ -744,52 +741,112 @@ if (!isMWOrder(order, null)) {
     res.status(500).send("error");
   }
 }
+
+
 app.post("/admin/ss-hook", express.json(), async (req, res) => {
   try {
     const sec = req.headers["x-ss-webhook-secret"] || "";
-    if (!process.env.ADMIN_KEY || sec !== process.env.ADMIN_KEY) {
-      return res.status(401).json({ ok:false, error:"bad secret" });
+    const okSecret =
+      (process.env.SS_WH_SECRET && sec === process.env.SS_WH_SECRET) ||
+      (process.env.ADMIN_KEY && sec === process.env.ADMIN_KEY) ||
+      (process.env.SS_PASS && sec === process.env.SS_PASS);
+    if (!okSecret) {
+      res.status(401).json({ ok: false, error: "bad secret" });
+      return;
     }
 
     const b = req.body || {};
-    const orderNumber = String(b.orderNumber || b.order_number || "");
-    const carrierCode = String(b.carrierCode || b.carrier || "");
-    const trackingNumber = String(b.trackingNumber || b.tracking || "");
-    const trackingUrl = String(b.trackingUrl || "");
+    const rt = String(b.resource_type || "").toUpperCase();
+    const allow = ["SHIP_NOTIFY", "SHIPMENT_NOTIFY", "SHIPMENT_SHIPPED", "ORDER_SHIPPED"];
+    if (!allow.includes(rt)) {
+      res.status(200).json({ ok: true, action: "noop_unsupported_type", type: rt });
+      return;
+    }
+
+    const orderNumber = String(b.orderNumber || b.order_number || "").trim();
+    const trackingNumber = String(b.trackingNumber || b.tracking || b.tracking_number || "").trim();
+    const carrierCode = String(b.carrierCode || b.carrier || "").trim();
+    const trackingUrl = String(b.trackingUrl || b.tracking_url || "").trim();
 
     if (!orderNumber || !trackingNumber) {
-      return res.status(400).json({ ok:false, error:"missing orderNumber or trackingNumber" });
+      res.status(400).json({ ok: false, error: "missing orderNumber or trackingNumber" });
+      return;
     }
 
     const so = await shopifyFindOrderByNumber(orderNumber);
-    if (!so) return res.status(404).json({ ok:false, error:"shopify order not found" });
-
-    const unfulfilledLeft = (Array.isArray(so.line_items)?so.line_items:[])
-      .some(li => Number(li.fulfillable_quantity||0) > 0);
-
-    if (unfulfilledLeft) {
-      const bodyJson = shopifyBuildFulfillmentBody(so, {
-        carrierCode, trackingNumber, trackingUrl
-      });
-      await shopifyCreateFulfillment(so.id, bodyJson);
-      return res.json({ ok:true, action:"create_fulfillment", orderId: so.id });
-    } else {
-      const listUrl = `https://${process.env.SHOPIFY_SHOP}/admin/api/2025-01/fulfillments.json?order_id=${so.id}`;
-      const r = await fetch(listUrl, { headers:{ "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN }});
-      const j = await r.json();
-      const ff = (j.fulfillments||[]).filter(x => (x.status||"")!=="cancelled").pop();
-      if (ff && ff.id) {
-        const upd = { fulfillment:{ notify_customer:false, tracking_info:{ number:trackingNumber, url:trackingUrl||null, company:carrierCode||null } } };
-        const u = `https://${process.env.SHOPIFY_SHOP}/admin/api/2025-01/fulfillments/${ff.id}/update_tracking.json`;
-        await fetch(u, { method:"POST", headers:{ "X-Shopify-Access-Token":process.env.SHOPIFY_ADMIN_ACCESS_TOKEN, "Content-Type":"application/json" }, body: JSON.stringify(upd) });
-        return res.json({ ok:true, action:"update_tracking", orderId: so.id, fulfillmentId: ff.id });
-      }
-      return res.json({ ok:true, action:"noop_no_open_and_no_ff", orderId: so.id });
+    if (!so) {
+      res.status(404).json({ ok: false, error: "shopify order not found", orderNumber });
+      return;
     }
+
+    const shop = process.env.SHOPIFY_SHOP;
+    const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+
+    const ffsRes = await fetch(`https://${shop}/admin/api/2025-01/orders/${so.id}/fulfillments.json`, {
+      headers: { "X-Shopify-Access-Token": token }
+    });
+    if (!ffsRes.ok) {
+      const t = await ffsRes.text().catch(()=>"");
+      res.status(502).json({ ok: false, error: `fulfillments fetch ${ffsRes.status}`, body: t.slice(0,400) });
+      return;
+    }
+    const ffsJson = await ffsRes.json();
+    const fulfillments = Array.isArray(ffsJson.fulfillments) ? ffsJson.fulfillments : [];
+    const active = fulfillments.filter(f => String(f.status).toLowerCase() !== "cancelled");
+    const lastFf = active.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at)).slice(-1)[0];
+
+    const unfulfilled = (Array.isArray(so.line_items) ? so.line_items : [])
+      .filter(li => Number(li.fulfillable_quantity || 0) > 0)
+      .map(li => ({ id: li.id, quantity: li.fulfillable_quantity }));
+
+    if (!lastFf && unfulfilled.length > 0) {
+      const bodyCreate = shopifyBuildFulfillmentBody(so, {
+        carrierCode,
+        carrier: carrierCode,
+        trackingNumber,
+        trackingUrl
+      });
+      bodyCreate.fulfillment.line_items = unfulfilled;
+      await shopifyCreateFulfillment(so.id, bodyCreate);
+      res.status(200).json({ ok: true, action: "created_fulfillment", orderId: so.id, orderNumber, trackingNumber });
+      return;
+    }
+
+    const ffId = lastFf ? lastFf.id : null;
+    if (!ffId) {
+      res.status(200).json({ ok: true, action: "noop_no_open_and_no_ff", orderId: so.id });
+      return;
+    }
+
+    const updPayload = {
+      fulfillment: {
+        notify_customer: false,
+        tracking_info: {
+          number: trackingNumber,
+          url: trackingUrl || null,
+          company: carrierCode || null
+        }
+      }
+    };
+
+    const updRes = await fetch(`https://${shop}/admin/api/2025-01/fulfillments/${ffId}/update_tracking.json`, {
+      method: "POST",
+      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify(updPayload)
+    });
+    if (!updRes.ok) {
+      const t = await updRes.text().catch(()=>"");
+      res.status(502).json({ ok: false, error: `update_tracking ${updRes.status}`, body: t.slice(0,400) });
+      return;
+    }
+
+    res.status(200).json({ ok: true, action: "updated_tracking", orderId: so.id, fulfillmentId: ffId, trackingNumber });
   } catch (e) {
-    res.status(500).json({ ok:false, error:String(e.message||e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+
+
 
 app.post("/webhooks/orders-create", handleOrderCreateOrUpdate);
 app.post("/webhooks/orders-updated", handleOrderCreateOrUpdate);
