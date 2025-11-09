@@ -746,6 +746,17 @@ if (!isMWOrder(order, null)) {
     res.status(500).send("error");
   }
 }
+async function shopifyFindOrderByNumber(orderNumber) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const name = `#${orderNumber}`;
+  const url = `https://${shop}/admin/api/2025-01/orders.json?status=any&name=${encodeURIComponent(name)}`;
+  const r = await fetch(url, { headers: { "X-Shopify-Access-Token": token } });
+  if (!r.ok) return null;
+  const j = await r.json();
+  const arr = Array.isArray(j.orders) ? j.orders : [];
+  return arr[0] || null;
+}
 
 app.post("/admin/ss-hook", express.json(), async (req, res) => {
   try {
