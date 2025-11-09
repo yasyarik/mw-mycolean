@@ -1015,7 +1015,7 @@ function minimalOrderNode(o) {
       <LineItemID>${esc(i.id)}</LineItemID>
       <SKU>${esc(skuSafe(i, o.id))}</SKU>
       <Name>${esc(i.title)}</Name>
-      <Quantity>${i.qty)}</Quantity>
+      <Quantity>${i.qty}</Quantity>
       <UnitPrice>${money2(i.unitPrice)}</UnitPrice>
       <ImageUrl>${esc(i.imageUrl)}</ImageUrl>
       <Adjustment>false</Adjustment>
