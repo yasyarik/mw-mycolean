@@ -5,6 +5,7 @@ import crypto from "crypto";
 
 dotenv.config();
 const app = express();
+app.set("etag", false);
 
 function hmacOk(raw, header, secret) {
   if (!header || !secret) return false;
@@ -1032,6 +1033,11 @@ function authOK(req) {
 
 app.use("/shipstation", async (req, res) => {
   res.set("Content-Type", "application/xml; charset=utf-8");
+res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+res.set("Pragma", "no-cache");
+res.set("Expires", "0");
+res.set("Surrogate-Control", "no-store");
+res.set("Vary", "since, ids");
 
   const checkId = req.query.checkorder_id;
   if (checkId) {
@@ -1129,6 +1135,12 @@ app.get("/health", async (req, res) => {
       const variantId = req.query.variant_id ? String(req.query.variant_id) : null;
       const map = await buildBundleMap({ onlyProductId: productId, onlyVariantId: variantId });
       res.set("Content-Type", "application/json; charset=utf-8");
+      res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+res.set("Pragma", "no-cache");
+res.set("Expires", "0");
+res.set("Surrogate-Control", "no-store");
+res.set("Vary", "since, ids");
+
       res.status(200).send(JSON.stringify({ ok: true, keys: Object.keys(map).length, map }, null, 2));
       return;
     }
