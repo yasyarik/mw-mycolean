@@ -798,15 +798,24 @@ async function shopifyCreateFulfillment(orderId, body) {
 
 app.post("/admin/ss-hook", express.json(), async (req, res) => {
   try {
-    const sec = req.headers["x-ss-webhook-secret"] || "";
-    const okSecret =
-      (process.env.SS_WH_SECRET && sec === process.env.SS_WH_SECRET) ||
-      (process.env.ADMIN_KEY && sec === process.env.ADMIN_KEY) ||
-      (process.env.SS_PASS && sec === process.env.SS_PASS);
-    if (!okSecret) {
-      res.status(401).json({ ok: false, error: "bad secret" });
-      return;
-    }
+  const hdrSec = req.headers["x-ss-webhook-secret"] || "";
+const qSec = (req.query.secret || req.query.sec || req.query.key || "").toString();
+const auth = req.headers.authorization || "";
+let baPass = "";
+if (auth.startsWith("Basic ")) {
+  const s = Buffer.from(auth.slice(6), "base64").toString("utf8");
+  baPass = (s.split(":", 2)[1] || "").trim();
+}
+const sec = hdrSec || qSec || baPass;
+const okSecret =
+  (process.env.SS_WH_SECRET && sec === process.env.SS_WH_SECRET) ||
+  (process.env.ADMIN_KEY && sec === process.env.ADMIN_KEY) ||
+  (process.env.SS_PASS && sec === process.env.SS_PASS);
+if (!okSecret) {
+  res.status(401).json({ ok: false, error: "bad secret" });
+  return;
+}
+
 
     const b = req.body || {};
     const rt = String(b.resource_type || "").toUpperCase();
