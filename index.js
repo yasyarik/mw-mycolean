@@ -764,7 +764,7 @@ if (!okSecret) {
   return;
 }
 
-    }
+    
     
     const b = req.body || {};
     const rt = String(b.resource_type || "").toUpperCase();
