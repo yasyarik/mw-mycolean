@@ -188,9 +188,12 @@ function sbDetectFromOrder(order) {
           price: toNum(c.price || 0),
           variant_id: c.variant_id || c.id || null
         }));
+        console.log(__ORD, `AfterSell/UpCart bundle detected: ${children.length} children`);
         return { children, subBundleParents };
       }
-    } catch (_) {}
+    } catch (e) {
+      console.log(__ORD, "AfterSell/UpCart parse error:", e.message);
+    }
   }
 
   const tagStr = String(order.tags || "").toLowerCase();
@@ -206,7 +209,11 @@ function sbDetectFromOrder(order) {
   const nonZero = items.filter(li => !zeroed(li));
 
   if ((zeroChildren.length && nonZero.length >= 1) || (zeroChildren.length && tagStr.includes("simple bundles"))) {
-    if (subBundleParents.length) {}
+    if (subBundleParents.length) {
+      for (const li of subBundleParents) {
+        console.log(__ORD, "SUB-BUNDLE NO CHILDREN", { id: li.id, title: li.title, sku: li.sku, variant_id: li.variant_id });
+      }
+    }
     const usedIdx = new Set();
     for (const ch of zeroChildren) {
       const das = Array.isArray(ch.discount_allocations) ? ch.discount_allocations : [];
@@ -384,34 +391,44 @@ function mapSSStatus(o) {
 }
 
 async function getVariantImage(variantId) {
-  if (!variantId) return "";
+  if (!variantId) {
+    console.log("getVariantImage: NO variant_id");
+    return "";
+  }
   const key = String(variantId);
   if (variantImageCache.has(key)) {
     const cached = variantImageCache.get(key);
+    console.log(`CACHE HIT variant:${variantId} → ${cached || "EMPTY"}`);
     return cached;
   }
   const shop = process.env.SHOPIFY_SHOP;
   const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
   if (!shop) {
+    console.log("MISSING SHOPIFY_SHOP in .env");
     variantImageCache.set(key, "");
     return "";
   }
   if (!token) {
+    console.log("MISSING SHOPIFY_ADMIN_ACCESS_TOKEN in .env");
     variantImageCache.set(key, "");
     return "";
   }
   const url = `https://${shop}/admin/api/2025-01/variants/${variantId}.json`;
+  console.log(`FETCHING: ${url}`);
   try {
     const res = await fetch(url, {
       headers: { "X-Shopify-Access-Token": token }
     });
+    console.log(`API RESPONSE: ${res.status} ${res.statusText}`);
     if (!res.ok) {
-      variantImageCache.set(key, "");
-      return "";
+      const errText = await res.text();
+      console.log(`API ERROR BODY: ${errText}`);
+      throw new Error(`HTTP ${res.status}`);
     }
     const data = await res.json();
     const variant = data.variant;
     if (!variant) {
+      console.log("NO variant in response");
       variantImageCache.set(key, "");
       return "";
     }
@@ -428,7 +445,8 @@ async function getVariantImage(variantId) {
     }
     variantImageCache.set(key, imageUrl);
     return imageUrl;
-  } catch (_) {
+  } catch (e) {
+    console.error(`IMAGE FETCH FAILED (variant ${variantId}):`, e.message);
     variantImageCache.set(key, "");
     return "";
   }
@@ -468,6 +486,7 @@ async function transformOrder(order) {
   const after = [];
   const handled = new Set();
   const tags = String(order.tags || "").toLowerCase();
+  const __ORD = `[ORDER ${order.id} ${order.name || ""}]`;
   const hasBundleTag =
     tags.includes("simple bundles") ||
     tags.includes("bundle") ||
@@ -479,6 +498,7 @@ async function transformOrder(order) {
   const sb = sbDetectFromOrder(order);
 
   if (!sb && !hasBundleTag) {
+    console.log(__ORD, "SKIP ORDER (no bundle detected)");
     return { after: [] };
   }
 
@@ -489,6 +509,12 @@ async function transformOrder(order) {
         handled.add(c.id);
         const imageUrl = await getVariantImage(c.variant_id);
         pushLine(after, c, imageUrl);
+        console.log(__ORD, "SB CHILD", {
+          id: c.id,
+          title: c.title,
+          variant_id: c.variant_id,
+          imageUrl: imageUrl ? "OK" : "NO"
+        });
       }
       const isLikelyBundleParent = (li) =>
         hasParentFlag(li) ||
@@ -524,6 +550,12 @@ async function transformOrder(order) {
           }
         }
         if (kids.length) {
+          console.log(__ORD, "SCANNER EXPAND SUB PARENT", {
+            li_id: li.id,
+            product_id: li.product_id,
+            variant_id: li.variant_id,
+            found_children: kids.length
+          });
           for (const ch of kids) {
             const vid = String(ch.variantId || ch.variant_id || ch.id || "").trim();
             const qty = Math.max(1, Number(ch.qty || ch.quantity || 1));
@@ -541,11 +573,13 @@ async function transformOrder(order) {
           }
           handled.add(li.id);
         } else {
+          console.log(__ORD, "SCANNER EXPAND SUB PARENT — NO KIDS — OUTPUT PARENT");
           const imageUrl = await getVariantImage(li.variant_id);
           pushLine(after, li, imageUrl);
           handled.add(li.id);
         }
-      } catch (_) {
+      } catch (e) {
+        console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e), "→ OUTPUT PARENT");
         const imageUrl = await getVariantImage(li.variant_id);
         pushLine(after, li, imageUrl);
         handled.add(li.id);
@@ -578,6 +612,12 @@ async function transformOrder(order) {
         }
       }
       if (Array.isArray(recipe) && recipe.length) {
+        console.log(__ORD, "SCANNER EXPAND UB PARENT", {
+          li_id: li.id,
+          product_id: li.product_id,
+          variant_id: li.variant_id,
+          found_children: recipe.length
+        });
         for (const r of recipe) {
           const vid = String(r.variantId || r.variant_id || r.id || "").trim();
           const qty = Math.max(1, Number(r.qty || r.quantity || 1));
@@ -595,11 +635,13 @@ async function transformOrder(order) {
         }
         handled.add(li.id);
       } else {
+        console.log(__ORD, "SCANNER EXPAND UB PARENT — NO KIDS — OUTPUT PARENT");
         const imageUrl = await getVariantImage(li.variant_id);
         pushLine(after, li, imageUrl);
         handled.add(li.id);
       }
-    } catch (_) {
+    } catch (e) {
+      console.log(__ORD, "SCANNER EXPAND ERROR", String(e && e.message || e), "→ OUTPUT PARENT");
       const imageUrl = await getVariantImage(li.variant_id);
       pushLine(after, li, imageUrl);
       handled.add(li.id);
@@ -632,54 +674,61 @@ async function handleOrderCreateOrUpdate(req, res) {
     }
     let order = JSON.parse(raw.toString("utf8"));
     const topic = String(req.headers["x-shopify-topic"] || "");
-async function refetchOrderById(id){
-  const shop = process.env.SHOPIFY_SHOP;
-  const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-  if (!shop || !admin) return null;
-  const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, { headers: { "X-Shopify-Access-Token": admin } });
-  if (!r.ok) return null;
-  const j = await r.json();
-  return j?.order || null;
-}
-async function refetchWithRetry(id, tries, delayMs){
-  let o = null;
-  for (let i=0;i<tries;i++){
-    o = await refetchOrderById(id);
-    const tags = String(o?.tags || "").toLowerCase();
-    const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
-    const hasPlan = Array.isArray(o?.line_items) && o.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
-    const hasSbProps = Array.isArray(o?.line_items) && o.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
-    if (hasTag || hasPlan || hasSbProps) return o;
-    await new Promise(r => setTimeout(r, delayMs));
-  }
-  return o;
-}
+    console.log("[WH] topic=%s id=%s name=%s", topic, order.id, order.name || "");
+    async function refetchOrderById(id){
+      const shop = process.env.SHOPIFY_SHOP;
+      const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+      if (!shop || !admin) return null;
+      const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, { headers: { "X-Shopify-Access-Token": admin } });
+      if (!r.ok) return null;
+      const j = await r.json();
+      return j?.order || null;
+    }
+    async function refetchWithRetry(id, tries, delayMs){
+      let o = null;
+      for (let i=0;i<tries;i++){
+        o = await refetchOrderById(id);
+        const tags = String(o?.tags || "").toLowerCase();
+        const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
+        const hasPlan = Array.isArray(o?.line_items) && o.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
+        const hasSbProps = Array.isArray(o?.line_items) && o.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
+        if (hasTag || hasPlan || hasSbProps) return o;
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+      return o;
+    }
 
     const okRecent = await isInLast10Orders(order.id);
     if (!okRecent) {
+      console.log("SKIP OLD ORDER (not in last 10):", order.id, order.name);
       res.status(200).send("ok");
       return;
     }
-if (topic === "orders/create") {
-  const o2 = await refetchWithRetry(order.id, 3, 1500);
-  if (o2) order = o2;
-} else {
-  const tags = String(order.tags || "").toLowerCase();
-  const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
-  const hasPlan = Array.isArray(order.line_items) && order.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
-  const hasSbProps = Array.isArray(order.line_items) && order.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
-  if (!(hasTag || hasPlan || hasSbProps)) {
-    const o2 = await refetchWithRetry(order.id, 2, 1200);
-    if (o2) order = o2;
-  }
-}
+    if (topic === "orders/create") {
+      const o2 = await refetchWithRetry(order.id, 3, 1500);
+      if (o2) order = o2;
+      if (o2) console.log("[WH] refetched order %s with tags=%s (line_items=%d)", order.id, String(order.tags||""), Array.isArray(order.line_items)?order.line_items.length:0);
+    } else {
+      const tags = String(order.tags || "").toLowerCase();
+      const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
+      const hasPlan = Array.isArray(order.line_items) && order.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
+      const hasSbProps = Array.isArray(order.line_items) && order.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
+      if (!(hasTag || hasPlan || hasSbProps)) {
+        const o2 = await refetchWithRetry(order.id, 2, 1200);
+        if (o2) order = o2;
+        if (o2) console.log("[WH] refetched order %s with tags=%s (line_items=%d)", order.id, String(order.tags||""), Array.isArray(order.line_items)?order.line_items.length:0);
+      }
+    }
 
-if (!isMWOrder(order, null)) {
-  res.status(200).send("ok");
-  return;
-}
+    console.log("[WH] pre-check MW order id=%s tags=%s", order.id, String(order.tags||""));
+    if (!isMWOrder(order, null)) {
+      console.log("[ORDER", order.id, order.name || "", "] SKIP: non-MW (no tags/flags)");
+      res.status(200).send("ok");
+      return;
+    }
 
     const conv = await transformOrder(order);
+    console.log("[WH] transformed id=%s after_items=%d", order.id, Array.isArray(conv.after)?conv.after.length:0);
     remember({
       id: order.id,
       name: order.name,
@@ -694,8 +743,11 @@ if (!isMWOrder(order, null)) {
     if (isMWOrder(order, conv)) {
       scheduleSSRefresh();
     }
+    console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
+    console.log("[WH] done id=%s status=%s", order.id, mapSSStatus(order));
     res.status(200).send("ok");
   } catch (e) {
+    console.error("Webhook error:", e);
     res.status(500).send("error");
   }
 }
@@ -860,8 +912,10 @@ app.post("/webhooks/orders-cancelled", async (req, res) => {
     }
     const order = JSON.parse(raw.toString("utf8"));
     statusById.set(order.id, "cancelled");
+    console.log("ORDER CANCELLED", order.id);
     res.status(200).send("ok");
   } catch (e) {
+    console.error("Cancel webhook error:", e);
     res.status(500).send("error");
   }
 });
@@ -961,7 +1015,7 @@ function minimalOrderNode(o) {
       <LineItemID>${esc(i.id)}</LineItemID>
       <SKU>${esc(skuSafe(i, o.id))}</SKU>
       <Name>${esc(i.title)}</Name>
-      <Quantity>${i.qty}</Quantity>
+      <Quantity>${i.qty)}</Quantity>
       <UnitPrice>${money2(i.unitPrice)}</UnitPrice>
       <ImageUrl>${esc(i.imageUrl)}</ImageUrl>
       <Adjustment>false</Adjustment>
