@@ -758,6 +758,39 @@ async function shopifyFindOrderByNumber(orderNumber) {
   return arr[0] || null;
 }
 
+function shopifyBuildFulfillmentBody(order, tracking) {
+  const unfulfilled = (Array.isArray(order.line_items) ? order.line_items : [])
+    .filter(li => Number(li.fulfillable_quantity || 0) > 0)
+    .map(li => ({ id: li.id, quantity: li.fulfillable_quantity }));
+
+  return {
+    fulfillment: {
+      notify_customer: false,
+      tracking_company: tracking.carrierCode || tracking.carrier || "",
+      tracking_number: tracking.trackingNumber || "",
+      tracking_url: tracking.trackingUrl || tracking.trackingUrlProvider || "",
+      line_items: unfulfilled
+    }
+  };
+}
+
+async function shopifyCreateFulfillment(orderId, body) {
+  const shop = process.env.SHOPIFY_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const url = `https://${shop}/admin/api/2025-01/orders/${orderId}/fulfillments.json`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(()=>"");
+    throw new Error(`Shopify fulfill err ${r.status} ${t}`);
+  }
+  return r.json();
+}
+
+
 app.post("/admin/ss-hook", express.json(), async (req, res) => {
   try {
     const sec = req.headers["x-ss-webhook-secret"] || "";
