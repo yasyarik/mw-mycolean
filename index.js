@@ -286,6 +286,8 @@ const history = [];
 const bestById = new Map();
 const statusById = new Map();
 const variantImageCache = new Map();
+const ORDER_RETRY_SCHEDULE = [15000, 45000, 120000];
+const orderRetryTimers = new Map();
 
 function remember(e) {
   history.push(e);
@@ -389,6 +391,11 @@ function mapSSStatus(o) {
     return "awaiting_shipment";
   }
 }
+function scheduleSSRefreshBurst() {
+  scheduleSSRefresh();
+  setTimeout(() => ssRefreshNow().catch(()=>{}), 15000);
+  setTimeout(() => ssRefreshNow().catch(()=>{}), 60000);
+}
 
 async function getVariantImage(variantId) {
   if (!variantId) {
@@ -480,6 +487,55 @@ async function getVariantBasics(variantId) {
   } catch {
     return { title: `Variant ${variantId}`, sku: null, price: 0 };
   }
+}
+async function refetchOrderByIdLite(id) {
+  try {
+    const shop = process.env.SHOPIFY_SHOP;
+    const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+    if (!shop || !admin) return null;
+    const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, {
+      headers: { "X-Shopify-Access-Token": admin }
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j?.order || null;
+  } catch { return null; }
+}
+
+async function refetchAndRebuild(orderId) {
+  const o = await refetchOrderByIdLite(orderId);
+  if (!o) return false;
+  const conv = await transformOrder(o);
+  const isMW = isMWOrder(o, conv);
+  remember({
+    id: o.id,
+    name: o.name,
+    email: o.email || "",
+    shipping_address: o.shipping_address || {},
+    billing_address: o.billing_address || {},
+    payload: conv,
+    created_at: o.created_at || new Date().toISOString(),
+    _ss_status: mapSSStatus(o)
+  });
+  if (isMW) scheduleSSRefresh();
+  return Array.isArray(conv?.after) && conv.after.length > 0;
+}
+
+function scheduleOrderEnrich(orderId) {
+  if (!orderId) return;
+  if (orderRetryTimers.has(orderId)) return;
+  const timers = [];
+  for (const ms of ORDER_RETRY_SCHEDULE) {
+    const t = setTimeout(async () => {
+      const ok = await refetchAndRebuild(orderId);
+      if (ok) {
+        for (const tt of timers) clearTimeout(tt);
+        orderRetryTimers.delete(orderId);
+      }
+    }, ms);
+    timers.push(t);
+  }
+  orderRetryTimers.set(orderId, timers);
 }
 
 async function transformOrder(order) {
@@ -719,6 +775,7 @@ async function handleOrderCreateOrUpdate(req, res) {
         if (o2) console.log("[WH] refetched order %s with tags=%s (line_items=%d)", order.id, String(order.tags||""), Array.isArray(order.line_items)?order.line_items.length:0);
       }
     }
+        scheduleOrderEnrich(order.id);
 
     console.log("[WH] pre-check MW order id=%s tags=%s", order.id, String(order.tags||""));
     if (!isMWOrder(order, null)) {
@@ -1096,6 +1153,7 @@ app.use("/shipstation", async (req, res) => {
   res.set("Expires", "0");
   res.set("Surrogate-Control", "no-store");
   res.set("Vary", "since, ids");
+console.log("[SS PULL]", JSON.stringify({ q: req.query, total_cached: bestById.size }));
 
   const checkId = req.query.checkorder_id;
   if (checkId) {
