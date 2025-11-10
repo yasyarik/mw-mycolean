@@ -1341,6 +1341,82 @@ app.post("/admin/backfill-shipments", express.json(), async (req, res) => {
     }
     const since = (req.query.since || req.body?.since || "").toString().trim();
     const orderNumbers = Array.isArray(req.body?.orderNumbers) ? req.body.orderNumbers.map(String) : [];
+
+if (orderNumbers.length > 0) {
+  try {
+    const token = req.header("API-Key") || process.env.SS_TOKEN || process.env.SS_V2_TOKEN || "";
+    if (!token) {
+      res.status(400).json({ ok: false, error: "missing ShipStation API-Key" });
+      return;
+    }
+    const hdrs = { "API-Key": token };
+    const results = [];
+
+    for (const on of orderNumbers) {
+      try {
+        const u = new URL("https://api.shipstation.com/v2/shipments");
+        u.searchParams.set("orderNumber", on);
+        u.searchParams.set("page", "1");
+        u.searchParams.set("page_size", "200");
+        u.searchParams.set("sort_by", "modified_at");
+        u.searchParams.set("sort_dir", "desc");
+
+        const r = await fetch(u.toString(), { headers: hdrs });
+        if (!r.ok) throw new Error(`SS ${r.status}`);
+        const data = await r.json();
+        const shipments = Array.isArray(data.shipments) ? data.shipments : [];
+
+        // Берём последнюю отгрузку по этому заказу с трекингом
+        const s = shipments.find(x => (x.trackingNumber || x.tracking_number) && (x.orderNumber || x.order_number));
+        if (!s) {
+          results.push({ orderNumber: on, status: "no_shipments" });
+          continue;
+        }
+
+        const orderNumber = String(s.orderNumber || s.order_number || "").trim();
+        const trackingNumber = String(s.trackingNumber || s.tracking_number || "").trim();
+        const carrierCode = String(s.carrierCode || s.carrier_code || "").trim();
+        const trackingUrl = String(s.trackingUrl || s.tracking_url || "").trim();
+
+        // ваши уже существующие хелперы
+        const so = await shopifyFindOrderByNumber(orderNumber);
+        if (!so) {
+          results.push({ orderNumber, status: "skip_no_shopify_order" });
+          continue;
+        }
+
+        const ff = String(so.fulfillment_status || "").toLowerCase();
+        const allFulfilled = ff === "fulfilled" || ff === "shipped";
+        const unfulfilledLeft = (Array.isArray(so.line_items) ? so.line_items : []).some(li => Number(li.fulfillable_quantity || 0) > 0);
+
+        if (!unfulfilledLeft || allFulfilled) {
+          results.push({ orderId: so.id, orderNumber, status: "already_fulfilled" });
+          continue;
+        }
+
+        const body = shopifyBuildFulfillmentBody(so, {
+          carrierCode,
+          carrier: carrierCode,
+          trackingNumber,
+          trackingUrl
+        });
+
+        await shopifyCreateFulfillment(so.id, body);
+        results.push({ orderId: so.id, orderNumber, status: "fulfilled", tracking: trackingNumber });
+      } catch (e) {
+        results.push({ orderNumber: on, status: "error", error: String(e.message || e) });
+      }
+    }
+
+    res.json({ ok: true, since: null, count: results.length, results });
+    return; // ВАЖНО: выходим, не запускаем старую ветку с пагинацией
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+    return;
+  }
+}
+
+    const orderNumbers = Array.isArray(req.body?.orderNumbers) ? req.body.orderNumbers.map(String) : [];
     if (!since && !orderNumbers.length) {
       res.status(400).json({ ok: false, error: "provide ?since=YYYY-MM-DD or body.orderNumbers[]" });
       return;
