@@ -1212,7 +1212,8 @@ function authAdmin(req) {
 }
 
 async function ssFetchShipments({ since, page = 1, pageSize = 100, orderNumbers = [] }, token) {
-  const hdrs = { "API-Key": token };
+ const hdrs = { "SS-Access-Token": token };
+
   const startIso = since ? new Date(`${since}T00:00:00Z`).toISOString() : null;
   const endIso = new Date().toISOString();
   const u = new URL("https://api.shipstation.com/v2/shipments");
@@ -1249,7 +1250,8 @@ app.post("/admin/backfill-shipments", express.json(), async (req, res) => {
       res.status(401).json({ ok: false, error: "unauthorized" });
       return;
     }
-    const token = req.header("API-Key") || process.env.SS_TOKEN || process.env.SS_V2_TOKEN || "";
+    const token = req.header("SS-Access-Token") || req.header("API-Key") || process.env.SS_TOKEN || process.env.SS_V2_TOKEN || "";
+
     if (!token) {
       res.status(400).json({ ok: false, error: "missing ShipStation API-Key" });
       return;
@@ -1332,7 +1334,8 @@ app.get("/admin/backfill-shipments", async (req, res) => {
       return;
     }
 
-    const token = req.header("API-Key") || process.env.SS_TOKEN || process.env.SS_V2_TOKEN || "";
+   const token = req.header("SS-Access-Token") || req.header("API-Key") || process.env.SS_TOKEN || process.env.SS_V2_TOKEN || "";
+
     if (!token) {
       res.status(400).json({ ok: false, error: "missing ShipStation API-Key" });
       return;
