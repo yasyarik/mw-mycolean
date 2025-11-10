@@ -286,8 +286,6 @@ const history = [];
 const bestById = new Map();
 const statusById = new Map();
 const variantImageCache = new Map();
-const ORDER_RETRY_SCHEDULE = [15000, 45000, 120000];
-const orderRetryTimers = new Map();
 
 function remember(e) {
   history.push(e);
@@ -307,7 +305,7 @@ async function isInLast10Orders(orderId) {
     const shop = process.env.SHOPIFY_SHOP;
     const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
     if (!shop || !token) return true;
-    const res = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=550&status=any&order=created_at%20desc&fields=id`, {
+    const res = await fetch(`https://${shop}/admin/api/2025-01/orders.json?limit=150&status=any&order=created_at%20desc&fields=id`, {
       headers: { "X-Shopify-Access-Token": token }
     });
     if (!res.ok) return true;
@@ -390,11 +388,6 @@ function mapSSStatus(o) {
   } catch (_) {
     return "awaiting_shipment";
   }
-}
-function scheduleSSRefreshBurst() {
-  scheduleSSRefresh();
-  setTimeout(() => ssRefreshNow().catch(()=>{}), 15000);
-  setTimeout(() => ssRefreshNow().catch(()=>{}), 60000);
 }
 
 async function getVariantImage(variantId) {
@@ -487,55 +480,6 @@ async function getVariantBasics(variantId) {
   } catch {
     return { title: `Variant ${variantId}`, sku: null, price: 0 };
   }
-}
-async function refetchOrderByIdLite(id) {
-  try {
-    const shop = process.env.SHOPIFY_SHOP;
-    const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-    if (!shop || !admin) return null;
-    const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, {
-      headers: { "X-Shopify-Access-Token": admin }
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return j?.order || null;
-  } catch { return null; }
-}
-
-async function refetchAndRebuild(orderId) {
-  const o = await refetchOrderByIdLite(orderId);
-  if (!o) return false;
-  const conv = await transformOrder(o);
-  const isMW = isMWOrder(o, conv);
-  remember({
-    id: o.id,
-    name: o.name,
-    email: o.email || "",
-    shipping_address: o.shipping_address || {},
-    billing_address: o.billing_address || {},
-    payload: conv,
-    created_at: o.created_at || new Date().toISOString(),
-    _ss_status: mapSSStatus(o)
-  });
-  if (isMW) scheduleSSRefresh();
-  return Array.isArray(conv?.after) && conv.after.length > 0;
-}
-
-function scheduleOrderEnrich(orderId) {
-  if (!orderId) return;
-  if (orderRetryTimers.has(orderId)) return;
-  const timers = [];
-  for (const ms of ORDER_RETRY_SCHEDULE) {
-    const t = setTimeout(async () => {
-      const ok = await refetchAndRebuild(orderId);
-      if (ok) {
-        for (const tt of timers) clearTimeout(tt);
-        orderRetryTimers.delete(orderId);
-      }
-    }, ms);
-    timers.push(t);
-  }
-  orderRetryTimers.set(orderId, timers);
 }
 
 async function transformOrder(order) {
@@ -775,7 +719,6 @@ async function handleOrderCreateOrUpdate(req, res) {
         if (o2) console.log("[WH] refetched order %s with tags=%s (line_items=%d)", order.id, String(order.tags||""), Array.isArray(order.line_items)?order.line_items.length:0);
       }
     }
-        scheduleOrderEnrich(order.id);
 
     console.log("[WH] pre-check MW order id=%s tags=%s", order.id, String(order.tags||""));
     if (!isMWOrder(order, null)) {
@@ -1145,24 +1088,6 @@ function authOK(req) {
   }
   return false;
 }
-function getOrderNum(o) {
-  const n1 = Number(String(o?.name || "").replace(/^#/, ""));
-  if (Number.isFinite(n1) && n1 > 0) return n1;
-  const n2 = Number(o?.order_number);
-  return Number.isFinite(n2) ? n2 : 0;
-}
-
-function uniqueById(arr) {
-  const seen = new Set();
-  const out = [];
-  for (const x of arr) {
-    const k = String(x?.id ?? "");
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    out.push(x);
-  }
-  return out;
-}
 
 app.use("/shipstation", async (req, res) => {
   res.set("Content-Type", "application/xml; charset=utf-8");
@@ -1171,7 +1096,6 @@ app.use("/shipstation", async (req, res) => {
   res.set("Expires", "0");
   res.set("Surrogate-Control", "no-store");
   res.set("Vary", "since, ids");
-console.log("[SS PULL]", JSON.stringify({ q: req.query, total_cached: bestById.size }));
 
   const checkId = req.query.checkorder_id;
   if (checkId) {
@@ -1232,30 +1156,21 @@ console.log("[SS PULL]", JSON.stringify({ q: req.query, total_cached: bestById.s
     candidates = Array.from(bestById.values());
   }
 
-candidates.sort((a, b) => getOrderNum(b) - getOrderNum(a));
+  candidates.sort((a,b) => {
+    const ta = Date.parse(a?.created_at || "") || 0;
+    const tb = Date.parse(b?.created_at || "") || 0;
+    return tb - ta;
+  });
 
-
-const IGNORE_SINCE = String(process.env.SS_IGNORE_SINCE || "1") === "1";
-const LAST_N = Math.max(1, Number(process.env.SS_LAST_N || 100));
-
-if (!IGNORE_SINCE && sinceStr) {
-  // Опционально: мягко уважаем since, но всё равно страхуемся хвостом по номерам
-  const ts = Date.parse(sinceStr);
-  if (Number.isFinite(ts)) {
-    const bySince = candidates.filter(o => (Date.parse(o?.created_at || "") || 0) >= ts);
-    const tail = candidates.slice(0, LAST_N);
-    candidates = uniqueById([...bySince, ...tail]);
-    console.log(`[SS FILTER] since="${sinceStr}" kept=${candidates.length} tailN=${LAST_N}`);
-  } else {
-    candidates = candidates.slice(0, LAST_N);
-    console.log(`[SS FILTER] since parse failed, fallback tailN=${LAST_N}`);
+  if (sinceStr) {
+    const ts = Date.parse(sinceStr);
+    if (Number.isFinite(ts)) {
+      candidates = candidates.filter(o => {
+        const t = Date.parse(o?.created_at || "") || 0;
+        return t >= ts;
+      });
+    }
   }
-} else {
-  // Полностью игнорируем since и просто отдаём последние N по номеру заказа
-  candidates = candidates.slice(0, LAST_N);
-  console.log(`[SS FILTER] ignore since; tailN=${LAST_N}`);
-}
-
 
   const picked = candidates.slice(0, limit);
   res.send(xmlForMany(picked));
@@ -1340,7 +1255,6 @@ app.post("/admin/backfill-shipments", express.json(), async (req, res) => {
       return;
     }
     const since = (req.query.since || req.body?.since || "").toString().trim();
- 
     const orderNumbers = Array.isArray(req.body?.orderNumbers) ? req.body.orderNumbers.map(String) : [];
     if (!since && !orderNumbers.length) {
       res.status(400).json({ ok: false, error: "provide ?since=YYYY-MM-DD or body.orderNumbers[]" });
