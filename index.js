@@ -1145,6 +1145,24 @@ function authOK(req) {
   }
   return false;
 }
+function getOrderNum(o) {
+  const n1 = Number(String(o?.name || "").replace(/^#/, ""));
+  if (Number.isFinite(n1) && n1 > 0) return n1;
+  const n2 = Number(o?.order_number);
+  return Number.isFinite(n2) ? n2 : 0;
+}
+
+function uniqueById(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    const k = String(x?.id ?? "");
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
 
 app.use("/shipstation", async (req, res) => {
   res.set("Content-Type", "application/xml; charset=utf-8");
@@ -1214,21 +1232,30 @@ console.log("[SS PULL]", JSON.stringify({ q: req.query, total_cached: bestById.s
     candidates = Array.from(bestById.values());
   }
 
-  candidates.sort((a,b) => {
-    const ta = Date.parse(a?.created_at || "") || 0;
-    const tb = Date.parse(b?.created_at || "") || 0;
-    return tb - ta;
-  });
+candidates.sort((a, b) => getOrderNum(b) - getOrderNum(a));
 
-  if (sinceStr) {
-    const ts = Date.parse(sinceStr);
-    if (Number.isFinite(ts)) {
-      candidates = candidates.filter(o => {
-        const t = Date.parse(o?.created_at || "") || 0;
-        return t >= ts;
-      });
-    }
+
+const IGNORE_SINCE = String(process.env.SS_IGNORE_SINCE || "1") === "1";
+const LAST_N = Math.max(1, Number(process.env.SS_LAST_N || 100));
+
+if (!IGNORE_SINCE && sinceStr) {
+  // Опционально: мягко уважаем since, но всё равно страхуемся хвостом по номерам
+  const ts = Date.parse(sinceStr);
+  if (Number.isFinite(ts)) {
+    const bySince = candidates.filter(o => (Date.parse(o?.created_at || "") || 0) >= ts);
+    const tail = candidates.slice(0, LAST_N);
+    candidates = uniqueById([...bySince, ...tail]);
+    console.log(`[SS FILTER] since="${sinceStr}" kept=${candidates.length} tailN=${LAST_N}`);
+  } else {
+    candidates = candidates.slice(0, LAST_N);
+    console.log(`[SS FILTER] since parse failed, fallback tailN=${LAST_N}`);
   }
+} else {
+  // Полностью игнорируем since и просто отдаём последние N по номеру заказа
+  candidates = candidates.slice(0, LAST_N);
+  console.log(`[SS FILTER] ignore since; tailN=${LAST_N}`);
+}
+
 
   const picked = candidates.slice(0, limit);
   res.send(xmlForMany(picked));
