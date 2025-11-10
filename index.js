@@ -57,7 +57,7 @@ function fmtShipDate(d = new Date()) {
   const day = pad(t.getUTCDate());
   const year = t.getUTCFullYear();
   const hours = pad(t.getUTCHours());
-  const minutes = pad(t.getUTCHours());
+  const minutes = pad(t.getUTCMinutes());
   return `${month}/${day}/${year} ${hours}:${minutes}`;
 }
 
@@ -288,6 +288,7 @@ const statusById = new Map();
 const variantImageCache = new Map();
 
 function remember(e) {
+  e._last_modified = new Date().toISOString();
   history.push(e);
   while (history.length > 100) history.shift();
   bestById.set(String(e.id), e);
@@ -664,6 +665,43 @@ async function transformOrder(order) {
   return { after };
 }
 
+async function refetchOrderById(id){
+  const shop = process.env.SHOPIFY_SHOP;
+  const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!shop || !admin) return null;
+  const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, { headers: { "X-Shopify-Access-Token": admin } });
+  if (!r.ok) return null;
+  const j = await r.json();
+  return j?.order || null;
+}
+
+async function refetchWithRetry(id, tries, delayMs){
+  let o = null;
+  for (let i=0;i<tries;i++){
+    o = await refetchOrderById(id);
+    const tags = String(o?.tags || "").toLowerCase();
+    const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
+    const hasPlan = Array.isArray(o?.line_items) && o.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
+    const hasSbProps = Array.isArray(o?.line_items) && o.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
+    if (hasTag || hasPlan || hasSbProps) return o;
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  return o;
+}
+
+async function refetchWithBackoff(id, delaysMs){
+  for (const d of delaysMs){
+    const o = await refetchOrderById(id);
+    const tags = String(o?.tags || "").toLowerCase();
+    const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
+    const hasPlan = Array.isArray(o?.line_items) && o.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
+    const hasSbProps = Array.isArray(o?.line_items) && o.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
+    if (hasTag || hasPlan || hasSbProps) return o;
+    await new Promise(r => setTimeout(r, d));
+  }
+  return null;
+}
+
 async function handleOrderCreateOrUpdate(req, res) {
   try {
     const raw = await getRawBody(req);
@@ -674,29 +712,6 @@ async function handleOrderCreateOrUpdate(req, res) {
     }
     let order = JSON.parse(raw.toString("utf8"));
     const topic = String(req.headers["x-shopify-topic"] || "");
-    console.log("[WH] topic=%s id=%s name=%s", topic, order.id, order.name || "");
-    async function refetchOrderById(id){
-      const shop = process.env.SHOPIFY_SHOP;
-      const admin = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-      if (!shop || !admin) return null;
-      const r = await fetch(`https://${shop}/admin/api/2025-01/orders/${encodeURIComponent(id)}.json`, { headers: { "X-Shopify-Access-Token": admin } });
-      if (!r.ok) return null;
-      const j = await r.json();
-      return j?.order || null;
-    }
-    async function refetchWithRetry(id, tries, delayMs){
-      let o = null;
-      for (let i=0;i<tries;i++){
-        o = await refetchOrderById(id);
-        const tags = String(o?.tags || "").toLowerCase();
-        const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
-        const hasPlan = Array.isArray(o?.line_items) && o.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
-        const hasSbProps = Array.isArray(o?.line_items) && o.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
-        if (hasTag || hasPlan || hasSbProps) return o;
-        await new Promise(r => setTimeout(r, delayMs));
-      }
-      return o;
-    }
 
     const okRecent = await isInLast10Orders(order.id);
     if (!okRecent) {
@@ -704,31 +719,50 @@ async function handleOrderCreateOrUpdate(req, res) {
       res.status(200).send("ok");
       return;
     }
+
     if (topic === "orders/create") {
-      const o2 = await refetchWithRetry(order.id, 3, 1500);
+      const o2 = await refetchWithBackoff(order.id, [1000,2000,4000,8000,16000]);
       if (o2) order = o2;
-      if (o2) console.log("[WH] refetched order %s with tags=%s (line_items=%d)", order.id, String(order.tags||""), Array.isArray(order.line_items)?order.line_items.length:0);
     } else {
       const tags = String(order.tags || "").toLowerCase();
       const hasTag = /(^|,)\s*(simple bundles|bundle|upcart|skio|subscription|aftersell)\s*(,|$)/.test(`,${tags},`);
       const hasPlan = Array.isArray(order.line_items) && order.line_items.some(li => li?.selling_plan_id || li?.selling_plan_allocation?.selling_plan_id);
       const hasSbProps = Array.isArray(order.line_items) && order.line_items.some(li => Array.isArray(li.properties) && li.properties.some(p => String(p?.name||"").toLowerCase().includes("_sb_")));
       if (!(hasTag || hasPlan || hasSbProps)) {
-        const o2 = await refetchWithRetry(order.id, 2, 1200);
+        const o2 = await refetchWithRetry(order.id, 2, 1500);
         if (o2) order = o2;
-        if (o2) console.log("[WH] refetched order %s with tags=%s (line_items=%d)", order.id, String(order.tags||""), Array.isArray(order.line_items)?order.line_items.length:0);
       }
     }
 
-    console.log("[WH] pre-check MW order id=%s tags=%s", order.id, String(order.tags||""));
     if (!isMWOrder(order, null)) {
+      setTimeout(async () => {
+        try {
+          const late = await refetchOrderById(order.id);
+          if (late && isMWOrder(late, null)) {
+            const convLate = await transformOrder(late);
+            remember({
+              id: late.id,
+              name: late.name,
+              email: late.email || "",
+              shipping_address: late.shipping_address || {},
+              billing_address: late.billing_address || {},
+              payload: convLate,
+              created_at: late.created_at || new Date().toISOString(),
+              _ss_status: mapSSStatus(late)
+            });
+            const saved = bestById.get(String(late.id));
+            if (saved) saved._last_modified = new Date().toISOString();
+            if (isMWOrder(late, convLate)) scheduleSSRefresh();
+            console.log("ORDER LATE-PROCESSED", late.id, "items:", convLate.after.length);
+          }
+        } catch (_) {}
+      }, 35000);
       console.log("[ORDER", order.id, order.name || "", "] SKIP: non-MW (no tags/flags)");
       res.status(200).send("ok");
       return;
     }
 
     const conv = await transformOrder(order);
-    console.log("[WH] transformed id=%s after_items=%d", order.id, Array.isArray(conv.after)?conv.after.length:0);
     remember({
       id: order.id,
       name: order.name,
@@ -740,11 +774,12 @@ async function handleOrderCreateOrUpdate(req, res) {
       _ss_status: mapSSStatus(order)
     });
     statusById.set(order.id, "awaiting_shipment");
+    const saved = bestById.get(String(order.id));
+    if (saved) saved._last_modified = new Date().toISOString();
     if (isMWOrder(order, conv)) {
       scheduleSSRefresh();
     }
     console.log("ORDER PROCESSED", order.id, "items:", conv.after.length);
-    console.log("[WH] done id=%s status=%s", order.id, mapSSStatus(order));
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -790,7 +825,7 @@ async function shopifyCreateFulfillment(orderId, body) {
     body: JSON.stringify(body)
   });
   if (!r.ok) {
-    const t = await r.text().catch(()=>"");
+    const t = await r.text().catch(()=> "");
     throw new Error(`Shopify fulfill err ${r.status} ${t}`);
   }
   return r.json();
@@ -798,24 +833,15 @@ async function shopifyCreateFulfillment(orderId, body) {
 
 app.post("/admin/ss-hook", express.json(), async (req, res) => {
   try {
-  const hdrSec = req.headers["x-ss-webhook-secret"] || "";
-const qSec = (req.query.secret || req.query.sec || req.query.key || "").toString();
-const auth = req.headers.authorization || "";
-let baPass = "";
-if (auth.startsWith("Basic ")) {
-  const s = Buffer.from(auth.slice(6), "base64").toString("utf8");
-  baPass = (s.split(":", 2)[1] || "").trim();
-}
-const sec = hdrSec || qSec || baPass;
-const okSecret =
-  (process.env.SS_WH_SECRET && sec === process.env.SS_WH_SECRET) ||
-  (process.env.ADMIN_KEY && sec === process.env.ADMIN_KEY) ||
-  (process.env.SS_PASS && sec === process.env.SS_PASS);
-if (!okSecret) {
-  res.status(401).json({ ok: false, error: "bad secret" });
-  return;
-}
-
+    const sec = req.headers["x-ss-webhook-secret"] || "";
+    const okSecret =
+      (process.env.SS_WH_SECRET && sec === process.env.SS_WH_SECRET) ||
+      (process.env.ADMIN_KEY && sec === process.env.ADMIN_KEY) ||
+      (process.env.SS_PASS && sec === process.env.SS_PASS);
+    if (!okSecret) {
+      res.status(401).json({ ok: false, error: "bad secret" });
+      return;
+    }
 
     const b = req.body || {};
     const rt = String(b.resource_type || "").toUpperCase();
@@ -848,7 +874,7 @@ if (!okSecret) {
       headers: { "X-Shopify-Access-Token": token }
     });
     if (!ffsRes.ok) {
-      const t = await ffsRes.text().catch(()=>"");
+      const t = await ffsRes.text().catch(()=> "");
       res.status(502).json({ ok: false, error: `fulfillments fetch ${ffsRes.status}`, body: t.slice(0,400) });
       return;
     }
@@ -897,7 +923,7 @@ if (!okSecret) {
       body: JSON.stringify(updPayload)
     });
     if (!updRes.ok) {
-      const t = await updRes.text().catch(()=>"");
+      const t = await updRes.text().catch(()=> "");
       res.status(502).json({ ok: false, error: `update_tracking ${updRes.status}`, body: t.slice(0,400) });
       return;
     }
@@ -905,27 +931,6 @@ if (!okSecret) {
     res.status(200).json({ ok: true, action: "updated_tracking", orderId: so.id, fulfillmentId: ffId, trackingNumber });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-app.post("/webhooks/orders-create", handleOrderCreateOrUpdate);
-app.post("/webhooks/orders-updated", handleOrderCreateOrUpdate);
-
-app.post("/webhooks/orders-cancelled", async (req, res) => {
-  try {
-    const raw = await getRawBody(req);
-    const hdr = req.headers["x-shopify-hmac-sha256"] || "";
-    if (!hmacOk(raw, hdr, process.env.SHOPIFY_WEBHOOK_SECRET || "")) {
-      res.status(401).send("bad hmac");
-      return;
-    }
-    const order = JSON.parse(raw.toString("utf8"));
-    statusById.set(order.id, "cancelled");
-    console.log("ORDER CANCELLED", order.id);
-    res.status(200).send("ok");
-  } catch (e) {
-    console.error("Cancel webhook error:", e);
-    res.status(500).send("error");
   }
 });
 
@@ -946,7 +951,7 @@ function minimalXML(o) {
   const ship = filledAddress(o.shipping_address || o.billing_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
-  const lastMod = fmtShipDate(new Date());
+  const lastMod = fmtShipDate(new Date(o._last_modified || Date.now()));
   const shipStationStatus = o._ss_status || "awaiting_shipment";
   const itemsXml = items.map(i => `
     <Item>
@@ -1017,7 +1022,7 @@ function minimalOrderNode(o) {
   const ship = filledAddress(o.shipping_address || o.billing_address || {});
   const email = (o.email && o.email.includes("@")) ? o.email : "customer@example.com";
   const orderDate = fmtShipDate(new Date(o.created_at || Date.now()));
-  const lastMod = fmtShipDate(new Date());
+  const lastMod = fmtShipDate(new Date(o._last_modified || Date.now()));
   const shipStationStatus = o._ss_status || "awaiting_shipment";
   const itemsXml = items.map(i => `
     <Item>
@@ -1097,6 +1102,13 @@ app.use("/shipstation", async (req, res) => {
   res.set("Surrogate-Control", "no-store");
   res.set("Vary", "since, ids");
 
+  try {
+    console.log("[SS PULL]", JSON.stringify({
+      q: req.query,
+      total_cached: bestById.size
+    }));
+  } catch (_) {}
+
   const checkId = req.query.checkorder_id;
   if (checkId) {
     const shop = process.env.SHOPIFY_SHOP;
@@ -1110,7 +1122,7 @@ app.use("/shipstation", async (req, res) => {
         headers: { "X-Shopify-Access-Token": admin }
       });
       if (!r.ok) {
-        const body = await r.text().catch(()=>"");
+        const body = await r.text().catch(()=> "");
         res.status(502).send(`<?xml version="1.0" encoding="utf-8"?><Error>Shopify fetch failed ${r.status} ${r.statusText} ${esc(body)}</Error>`);
         return;
       }
@@ -1125,7 +1137,8 @@ app.use("/shipstation", async (req, res) => {
         billing_address: order.billing_address || {},
         payload: conv,
         created_at: order.created_at || new Date().toISOString(),
-        _ss_status: mapSSStatus(order)
+        _ss_status: mapSSStatus(order),
+        _last_modified: new Date().toISOString()
       };
       res.status(200).send(xmlForMany([shadow]));
       return;
@@ -1157,8 +1170,8 @@ app.use("/shipstation", async (req, res) => {
   }
 
   candidates.sort((a,b) => {
-    const ta = Date.parse(a?.created_at || "") || 0;
-    const tb = Date.parse(b?.created_at || "") || 0;
+    const ta = Date.parse(a?._last_modified || a?.created_at || "") || 0;
+    const tb = Date.parse(b?._last_modified || b?.created_at || "") || 0;
     return tb - ta;
   });
 
@@ -1166,7 +1179,10 @@ app.use("/shipstation", async (req, res) => {
     const ts = Date.parse(sinceStr);
     if (Number.isFinite(ts)) {
       candidates = candidates.filter(o => {
-        const t = Date.parse(o?.created_at || "") || 0;
+        const t =
+          Date.parse(o?._last_modified || "") ||
+          Date.parse(o?.created_at || "") ||
+          0;
         return t >= ts;
       });
     }
